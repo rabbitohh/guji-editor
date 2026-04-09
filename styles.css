@@ -21,6 +21,7 @@ html,
 body {
   margin: 0;
   min-height: 100%;
+  scrollbar-gutter: stable;
   font-family: "Noto Serif SC", "Source Han Serif SC", "Songti SC", serif;
   background:
     radial-gradient(circle at top left, rgba(255, 255, 255, 0.8), transparent 32%),
@@ -226,6 +227,62 @@ h1 {
   gap: 10px;
 }
 
+.page-preview {
+  display: none;
+  margin-bottom: 14px;
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  background: rgba(255, 252, 246, 0.94);
+  overflow: hidden;
+}
+
+.page-preview-frame {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  max-height: 220px;
+  padding: 10px;
+  background:
+    linear-gradient(135deg, rgba(255, 255, 255, 0.72), transparent 40%),
+    #eadfc9;
+}
+
+.page-preview-frame img {
+  display: block;
+  max-width: 100%;
+  max-height: 200px;
+  width: auto;
+  height: auto;
+  border-radius: 12px;
+  box-shadow: 0 10px 24px rgba(60, 40, 18, 0.16);
+}
+
+.page-preview-meta {
+  padding: 10px 12px 12px;
+}
+
+.page-preview-meta strong {
+  display: block;
+  margin-bottom: 4px;
+}
+
+.page-item-preview {
+  margin: 10px 0 8px;
+  border-radius: 12px;
+  overflow: hidden;
+  border: 1px solid rgba(168, 142, 99, 0.28);
+  background:
+    linear-gradient(135deg, rgba(255, 255, 255, 0.72), transparent 40%),
+    #eadfc9;
+}
+
+.page-item-preview img {
+  display: block;
+  width: 100%;
+  max-height: 140px;
+  object-fit: cover;
+}
+
 .page-item {
   padding: 12px;
   border: 1px solid var(--line);
@@ -337,27 +394,47 @@ h1 {
 
 .annotation-box {
   cursor: pointer;
-  transition: transform 0.15s ease, box-shadow 0.15s ease;
+  transition: box-shadow 0.15s ease;
+  touch-action: none;
 }
 
 .annotation-box:hover,
 .annotation-box.active {
-  transform: scale(1.01);
+  z-index: 2;
+}
+
+.annotation-box:hover .annotation-shape,
+.annotation-box.active .annotation-shape {
   box-shadow: 0 8px 18px rgba(44, 36, 24, 0.18);
 }
 
-.annotation-box[data-style="box"] {
+.annotation-box .annotation-shape {
+  position: absolute;
+  inset: 0;
+  border-radius: 8px;
+  pointer-events: none;
+}
+
+.annotation-box[data-style="box"] .annotation-shape {
   background: rgba(255, 255, 255, 0.05);
-  border: 2px solid currentColor;
+  border: 2px solid var(--annotation-color, #a64032);
 }
 
-.annotation-box[data-style="highlight"] {
+.annotation-box[data-style="highlight"] .annotation-shape {
   border: 1px solid transparent;
-  background: color-mix(in srgb, currentColor 24%, transparent);
+  background: var(--annotation-fill, rgba(166, 64, 50, 0.24));
 }
 
-.annotation-box[data-style="underline"] {
-  border-bottom: 4px solid currentColor;
+.annotation-box[data-style="underline"] .annotation-shape {
+  inset: auto 0 auto 0;
+  top: 50%;
+  height: 0;
+  width: var(--annotation-line-length, 100%);
+  left: 50%;
+  border-top: 4px solid var(--annotation-color, #a64032);
+  border-radius: 999px;
+  transform: translate(-50%, -50%) rotate(var(--annotation-rotation, 0deg));
+  transform-origin: center center;
   background: transparent;
 }
 
@@ -367,10 +444,79 @@ h1 {
   left: 0;
   padding: 2px 8px;
   border-radius: 999px;
-  background: color-mix(in srgb, currentColor 88%, #ffffff);
-  color: #fff;
+  background: white;
+  color: #1f170d;
   font-size: 12px;
   white-space: nowrap;
+  border: 1px solid rgba(44, 36, 24, 0.18);
+  box-shadow: 0 4px 10px rgba(44, 36, 24, 0.18);
+  font-weight: 700;
+  pointer-events: none;
+}
+
+.annotation-box .resize-handle {
+  position: absolute;
+  top: -8px;
+  right: -8px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #fff7ea;
+  border: 2px solid var(--annotation-color, #a64032);
+  box-shadow: 0 3px 8px rgba(44, 36, 24, 0.22);
+  cursor: nesw-resize;
+}
+
+.annotation-box .rotate-handle {
+  position: absolute;
+  top: -30px;
+  left: 50%;
+  width: 16px;
+  height: 16px;
+  margin-left: -8px;
+  border-radius: 50%;
+  background: #fff7ea;
+  border: 2px solid var(--annotation-color, #a64032);
+  box-shadow: 0 3px 8px rgba(44, 36, 24, 0.22);
+  cursor: grab;
+}
+
+.annotation-box .rotate-handle::before {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 14px;
+  width: 2px;
+  height: 14px;
+  margin-left: -1px;
+  background: var(--annotation-color, #a64032);
+  border-radius: 999px;
+}
+
+.annotation-box .rotate-handle:active {
+  cursor: grabbing;
+}
+
+.annotation-box .resize-handle::before,
+.annotation-box .resize-handle::after {
+  content: "";
+  position: absolute;
+  background: var(--annotation-color, #a64032);
+  border-radius: 999px;
+}
+
+.annotation-box .resize-handle::before {
+  width: 8px;
+  height: 2px;
+  left: 2px;
+  top: 6px;
+}
+
+.annotation-box .resize-handle::after {
+  width: 2px;
+  height: 8px;
+  left: 6px;
+  top: 2px;
 }
 
 .draft-box {

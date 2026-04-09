@@ -1,3 +1,8 @@
+const pdfjsLib = window.pdfjsLib || null;
+if (pdfjsLib?.GlobalWorkerOptions) {
+  pdfjsLib.GlobalWorkerOptions.workerSrc = "./vendor/pdfjs/pdf.worker.min.js";
+}
+
 const SAMPLE_PAGES = [
   { title: "不规则 / 3 (1).jpg", src: "古籍示例/不规则/3%20(1).jpg", sourceType: 2 },
   { title: "不规则 / 3 (1).png", src: "古籍示例/不规则/3%20(1).png", sourceType: 3 },
@@ -43,6 +48,7 @@ const ANNOTATION_TYPES = {
   char: "字",
   sentence: "句",
   paragraph: "段",
+  image: "图像",
 };
 const STYLE_LABELS = {
   box: "画框",
@@ -64,10 +70,12 @@ const elements = {
   mainPanel: document.getElementById("mainPanel"),
   inspectorPanel: document.getElementById("inspectorPanel"),
   pageImportInput: document.getElementById("pageImportInput"),
+  pdfImportInput: document.getElementById("pdfImportInput"),
   projectImportInput: document.getElementById("projectImportInput"),
   exportXmlButton: document.getElementById("exportXmlButton"),
   exportJsonButton: document.getElementById("exportJsonButton"),
   importJsonButton: document.getElementById("importJsonButton"),
+  newProjectButton: document.getElementById("newProjectButton"),
   resetProjectButton: document.getElementById("resetProjectButton"),
 };
 
@@ -122,6 +130,37 @@ function createDefaultState() {
   };
 }
 
+function createEmptyState() {
+  return {
+    meta: {
+      articleId: "",
+      type: "1",
+      version: "1.0",
+      title: "",
+      subtitle: "",
+      authors: "",
+      bookName: "",
+      bookVolume: "",
+      relationNote: "",
+      publishYear: "",
+      publishDynasty: "",
+      writingYear: "",
+      writingDynasty: "",
+      notes: "",
+    },
+    pages: [],
+    glyphs: [],
+    ui: {
+      activeTab: "editor",
+      currentPageId: null,
+      currentAnnotationId: null,
+      drawType: "char",
+      drawStyle: "box",
+      editingGlyphId: null,
+    },
+  };
+}
+
 function loadState() {
   const fallback = createDefaultState();
   try {
@@ -137,7 +176,7 @@ function loadState() {
 }
 
 function normalizeState(raw, fallback = createDefaultState()) {
-  const incomingPages = Array.isArray(raw.pages) && raw.pages.length ? raw.pages : fallback.pages;
+  const incomingPages = Array.isArray(raw.pages) ? raw.pages : fallback.pages;
   const pages = incomingPages.map((page, index) => ({
     id: page.id || `page-${index + 1}`,
     title: page.title || `第 ${index + 1} 页`,
@@ -205,6 +244,7 @@ function normalizeAnnotation(annotation, order) {
     noteType: NOTE_TYPES[annotation.noteType] ? annotation.noteType : "1",
     customGlyphId: annotation.customGlyphId || "",
     customCode: annotation.customCode || "",
+    lineAngle: normalizeAngle(annotation.lineAngle),
     x,
     y,
     width,
@@ -232,6 +272,16 @@ function bindGlobalEvents() {
   elements.importJsonButton.addEventListener("click", () => {
     elements.projectImportInput.value = "";
     elements.projectImportInput.click();
+  });
+
+  elements.newProjectButton.addEventListener("click", () => {
+    if (!window.confirm("新建项目会清空当前内容，是否继续？")) {
+      return;
+    }
+    state = createEmptyState();
+    persistState();
+    renderAll();
+    updateStatus("已新建空白项目。");
   });
 
   elements.projectImportInput.addEventListener("change", async (event) => {
@@ -285,6 +335,34 @@ function bindGlobalEvents() {
     renderAll();
     updateStatus(`已导入 ${importedPages.length} 张本地图片。`);
   });
+
+  elements.pdfImportInput.addEventListener("change", async (event) => {
+    const file = event.target.files?.[0];
+    if (!file) {
+      return;
+    }
+    if (!ensurePdfSupport()) {
+      return;
+    }
+    try {
+      const importedPages = await importPdfAsPages(file);
+      if (!importedPages.length) {
+        updateStatus("PDF 未解析出可导入页面。", true);
+        return;
+      }
+      state.pages = [...state.pages, ...importedPages];
+      state.ui.currentPageId = importedPages[0].id;
+      state.ui.currentAnnotationId = null;
+      persistState();
+      renderAll();
+      updateStatus(`已导入 PDF：${file.name}，共 ${importedPages.length} 页。`);
+    } catch (error) {
+      console.error("import pdf failed", error);
+      updateStatus("PDF 导入失败，请确认本地 pdf.min.js 和 pdf.worker.min.js 已放到 vendor/pdfjs 目录。", true);
+    }
+  });
+
+  document.addEventListener("keydown", handleGlobalKeydown);
 }
 
 function renderAll() {
@@ -328,8 +406,24 @@ function renderSidebar() {
     <div class="sidebar-card">
       <div class="section-title">
         <h2>页面列表</h2>
-        <span class="section-meta">按页整理</span>
       </div>
+      ${
+        currentPage
+          ? `
+            <div class="page-preview">
+              <div class="page-preview-frame">
+                <img src="${currentPage.src}" alt="${escapeAttribute(currentPage.title)}" />
+              </div>
+              <div class="page-preview-meta">
+                <strong>当前预览: 第 ${currentPage.pageNo} 页</strong>
+                <div>${escapeHtml(currentPage.title)}</div>
+              </div>
+            </div>
+          `
+          : `
+            <div class="page-preview empty-state">当前还没有页面可预览。</div>
+          `
+      }
       <div class="page-list">
         ${state.pages
           .map((page) => {
@@ -338,6 +432,15 @@ function renderSidebar() {
               <div class="page-item ${active}" data-page-id="${page.id}" draggable="true">
                 <strong>第 ${page.pageNo} 页</strong>
                 <div>${escapeHtml(page.title)}</div>
+                ${
+                  page.src
+                    ? `
+                      <div class="page-item-preview">
+                        <img src="${page.src}" alt="${escapeAttribute(page.title)}" loading="lazy" />
+                      </div>
+                    `
+                    : ""
+                }
                 <div class="mini-note">标注 ${page.annotations.length} 条 · 来源类型 ${page.sourceType}</div>
               </div>
             `;
@@ -409,6 +512,22 @@ function renderSidebar() {
     elements.pageImportInput.value = "";
     elements.pageImportInput.click();
   });
+
+  const pageActions = elements.pageSidebar.querySelector(".page-actions");
+  if (pageActions && !document.getElementById("importPdfButton")) {
+    const importPdfButton = document.createElement("button");
+    importPdfButton.id = "importPdfButton";
+    importPdfButton.textContent = "导入 PDF";
+    pageActions.appendChild(importPdfButton);
+    importPdfButton.addEventListener("click", () => {
+      if (!ensurePdfSupport()) {
+        return;
+      }
+      elements.pdfImportInput.value = "";
+      elements.pdfImportInput.click();
+    });
+  }
+
 }
 
 function clearPageDragState() {
@@ -709,11 +828,24 @@ function renderInspector() {
 function renderEditorInspector() {
   const currentPage = getCurrentPage();
   const annotation = getCurrentAnnotation();
+  const metaPlaceholders = {
+    articleId: "编号",
+    title: "标题",
+    subtitle: "副标题",
+    authors: "作者",
+    bookName: "书名",
+    bookVolume: "卷册",
+    publishYear: "出版时间",
+    writingYear: "写作时间",
+    publishDynasty: "朝代",
+    writingDynasty: "朝代",
+    relationNote: "关系说明",
+    notes: "项目说明",
+  };
   elements.inspectorPanel.innerHTML = `
     <div class="inspector-card">
       <div class="section-title">
         <h2>标注属性</h2>
-        <span class="section-meta">右侧录入框</span>
       </div>
       ${
         annotation
@@ -766,57 +898,56 @@ function renderEditorInspector() {
     <div class="inspector-card">
       <div class="section-title">
         <h2>项目元数据</h2>
-        <span class="section-meta">head 节点</span>
       </div>
       <form id="metaForm">
         <div class="field-grid">
           <div class="field-block">
             <label for="metaArticleId">article id</label>
-            <input id="metaArticleId" name="articleId" value="${escapeAttribute(state.meta.articleId)}" />
+            <input id="metaArticleId" name="articleId" value="${escapeAttribute(state.meta.articleId)}" placeholder="${metaPlaceholders.articleId}" />
           </div>
           <div class="field-block">
             <label for="metaTitle">title</label>
-            <input id="metaTitle" name="title" value="${escapeAttribute(state.meta.title)}" />
+            <input id="metaTitle" name="title" value="${escapeAttribute(state.meta.title)}" placeholder="${metaPlaceholders.title}" />
           </div>
           <div class="field-block">
             <label for="metaSubtitle">subtitle</label>
-            <input id="metaSubtitle" name="subtitle" value="${escapeAttribute(state.meta.subtitle)}" />
+            <input id="metaSubtitle" name="subtitle" value="${escapeAttribute(state.meta.subtitle)}" placeholder="${metaPlaceholders.subtitle}" />
           </div>
           <div class="field-block">
             <label for="metaAuthors">authors</label>
-            <input id="metaAuthors" name="authors" value="${escapeAttribute(state.meta.authors)}" />
+            <input id="metaAuthors" name="authors" value="${escapeAttribute(state.meta.authors)}" placeholder="${metaPlaceholders.authors}" />
           </div>
           <div class="field-block">
             <label for="metaBookName">book.name</label>
-            <input id="metaBookName" name="bookName" value="${escapeAttribute(state.meta.bookName)}" />
+            <input id="metaBookName" name="bookName" value="${escapeAttribute(state.meta.bookName)}" placeholder="${metaPlaceholders.bookName}" />
           </div>
           <div class="field-block">
             <label for="metaBookVolume">book.volume</label>
-            <input id="metaBookVolume" name="bookVolume" value="${escapeAttribute(state.meta.bookVolume)}" />
+            <input id="metaBookVolume" name="bookVolume" value="${escapeAttribute(state.meta.bookVolume)}" placeholder="${metaPlaceholders.bookVolume}" />
           </div>
           <div class="field-block">
             <label for="metaPublishYear">publish_date.year</label>
-            <input id="metaPublishYear" name="publishYear" value="${escapeAttribute(state.meta.publishYear)}" />
+            <input id="metaPublishYear" name="publishYear" value="${escapeAttribute(state.meta.publishYear)}" placeholder="${metaPlaceholders.publishYear}" />
           </div>
           <div class="field-block">
             <label for="metaWritingYear">writing_date.year</label>
-            <input id="metaWritingYear" name="writingYear" value="${escapeAttribute(state.meta.writingYear)}" />
+            <input id="metaWritingYear" name="writingYear" value="${escapeAttribute(state.meta.writingYear)}" placeholder="${metaPlaceholders.writingYear}" />
           </div>
           <div class="field-block">
             <label for="metaPublishDynasty">publish_date.dynasty</label>
-            <input id="metaPublishDynasty" name="publishDynasty" value="${escapeAttribute(state.meta.publishDynasty)}" />
+            <input id="metaPublishDynasty" name="publishDynasty" value="${escapeAttribute(state.meta.publishDynasty)}" placeholder="${metaPlaceholders.publishDynasty}" />
           </div>
           <div class="field-block">
             <label for="metaWritingDynasty">writing_date.dynasty</label>
-            <input id="metaWritingDynasty" name="writingDynasty" value="${escapeAttribute(state.meta.writingDynasty)}" />
+            <input id="metaWritingDynasty" name="writingDynasty" value="${escapeAttribute(state.meta.writingDynasty)}" placeholder="${metaPlaceholders.writingDynasty}" />
           </div>
           <div class="field-block full">
             <label for="metaRelationNote">relation.note</label>
-            <input id="metaRelationNote" name="relationNote" value="${escapeAttribute(state.meta.relationNote)}" />
+            <input id="metaRelationNote" name="relationNote" value="${escapeAttribute(state.meta.relationNote)}" placeholder="${metaPlaceholders.relationNote}" />
           </div>
           <div class="field-block full">
             <label for="metaNotes">项目说明</label>
-            <textarea id="metaNotes" name="notes">${escapeHtml(state.meta.notes)}</textarea>
+            <textarea id="metaNotes" name="notes" placeholder="${metaPlaceholders.notes}">${escapeHtml(state.meta.notes)}</textarea>
           </div>
         </div>
       </form>
@@ -900,6 +1031,8 @@ function renderXmlInspector() {
 }
 
 function renderAnnotationForm(annotation) {
+  const primaryLabel = annotation.type === "image" ? "图像名称/说明" : "原文录入";
+  const primaryPlaceholder = annotation.type === "image" ? "输入图像区域名称或说明" : "输入古籍原字或原句";
   return `
     <form id="annotationForm">
       <div class="field-grid">
@@ -925,40 +1058,74 @@ function renderAnnotationForm(annotation) {
           <label for="annotationColor">颜色</label>
           <input id="annotationColor" type="color" name="color" value="${escapeAttribute(annotation.color)}" />
         </div>
-        <div class="field-block">
-          <label for="annotationNoteType">注释类型</label>
-          <select id="annotationNoteType" name="noteType">
-            ${Object.entries(NOTE_TYPES)
-              .map(([key, label]) => `<option value="${key}" ${annotation.noteType === key ? "selected" : ""}>${label}</option>`)
-              .join("")}
-          </select>
-        </div>
+        ${
+          annotation.markStyle === "underline"
+            ? `
+              <div class="field-block">
+                <label for="annotationLineAngle">划线方向 (0-360°)</label>
+                <input id="annotationLineAngle" name="lineAngle" type="number" min="0" max="360" step="1" value="${round(annotation.lineAngle)}" />
+              </div>
+            `
+            : ""
+        }
+        ${
+          annotation.type === "image"
+            ? ""
+            : `
+              <div class="field-block">
+                <label for="annotationNoteType">注释类型</label>
+                <select id="annotationNoteType" name="noteType">
+                  ${Object.entries(NOTE_TYPES)
+                    .map(([key, label]) => `<option value="${key}" ${annotation.noteType === key ? "selected" : ""}>${label}</option>`)
+                    .join("")}
+                </select>
+              </div>
+            `
+        }
         <div class="field-block full">
-          <label for="annotationOriginal">原文录入</label>
-          <input id="annotationOriginal" name="originalText" value="${escapeAttribute(annotation.originalText)}" placeholder="输入古籍原字或原句" />
+          <label for="annotationOriginal">${primaryLabel}</label>
+          <input id="annotationOriginal" name="originalText" value="${escapeAttribute(annotation.originalText)}" placeholder="${primaryPlaceholder}" />
         </div>
-        <div class="field-block full">
-          <label for="annotationSimplified">简体录入</label>
-          <input id="annotationSimplified" name="simplifiedText" value="${escapeAttribute(annotation.simplifiedText)}" placeholder="输入对应的简体内容" />
-        </div>
-        <div class="field-block">
-          <label for="annotationGlyph">造字关联</label>
-          <select id="annotationGlyph" name="customGlyphId">
-            <option value="">不使用</option>
-            ${state.glyphs
-              .map(
-                (glyph) =>
-                  `<option value="${glyph.id}" ${annotation.customGlyphId === glyph.id ? "selected" : ""}>${escapeHtml(
-                    `${glyph.unicode} ${glyph.traditional || glyph.simplified || ""}`
-                  )}</option>`
-              )
-              .join("")}
-          </select>
-        </div>
-        <div class="field-block">
-          <label for="annotationCustomCode">自定义编码</label>
-          <input id="annotationCustomCode" name="customCode" value="${escapeAttribute(annotation.customCode)}" placeholder="如 E000" />
-        </div>
+        ${
+          annotation.type === "image"
+            ? ""
+            : `
+              <div class="field-block full">
+                <label for="annotationSimplified">简体录入</label>
+                <input id="annotationSimplified" name="simplifiedText" value="${escapeAttribute(annotation.simplifiedText)}" placeholder="输入对应的简体内容" />
+              </div>
+            `
+        }
+        ${
+          annotation.type === "image"
+            ? ""
+            : `
+              <div class="field-block">
+                <label for="annotationGlyph">造字关联</label>
+                <select id="annotationGlyph" name="customGlyphId">
+                  <option value="">不使用</option>
+                  ${state.glyphs
+                    .map(
+                      (glyph) =>
+                        `<option value="${glyph.id}" ${annotation.customGlyphId === glyph.id ? "selected" : ""}>${escapeHtml(
+                          `${glyph.unicode} ${glyph.traditional || glyph.simplified || ""}`
+                        )}</option>`
+                    )
+                    .join("")}
+                </select>
+              </div>
+            `
+        }
+        ${
+          annotation.type === "image"
+            ? ""
+            : `
+              <div class="field-block">
+                <label for="annotationCustomCode">自定义编码</label>
+                <input id="annotationCustomCode" name="customCode" value="${escapeAttribute(annotation.customCode)}" placeholder="如 E000" />
+              </div>
+            `
+        }
         <div class="field-block">
           <label for="annotationX">起始 X (%)</label>
           <input id="annotationX" name="x" type="number" min="0" max="100" step="0.1" value="${round(annotation.x * 100)}" />
@@ -1000,7 +1167,14 @@ function handlePageInput(event) {
     return;
   }
   const value = event.target.name === "sourceType" || event.target.name === "direction" ? Number(event.target.value) : event.target.value;
-  updateCurrentPage({ [event.target.name]: value });
+  updateCurrentPage(
+    { [event.target.name]: value },
+    {
+      renderSidebar: ["title", "sourceType"].includes(event.target.name),
+      renderMainPanel: false,
+      renderInspector: false,
+    }
+  );
 }
 
 function handleAnnotationInput(event) {
@@ -1011,23 +1185,55 @@ function handleAnnotationInput(event) {
   let value = event.target.value;
   if (["x", "y", "width", "height"].includes(event.target.name)) {
     value = clamp01(Number(value) / 100);
+  } else if (event.target.name === "lineAngle") {
+    value = normalizeAngle(value);
   }
-  updateCurrentAnnotation({ [event.target.name]: value });
+  updateCurrentAnnotation(
+    { [event.target.name]: value },
+    {
+      renderMainPanel: [
+        "type",
+        "markStyle",
+        "color",
+        "originalText",
+        "simplifiedText",
+        "customGlyphId",
+        "lineAngle",
+        "x",
+        "y",
+        "width",
+        "height",
+      ].includes(event.target.name),
+      renderInspector: event.target.name === "markStyle",
+    }
+  );
 }
 
-function updateCurrentPage(patch) {
+function updateCurrentPage(
+  patch,
+  { renderSidebar: shouldRenderSidebar = true, renderMainPanel: shouldRenderMainPanel = true, renderInspector: shouldRenderInspector = true } = {}
+) {
   const currentPage = getCurrentPage();
   if (!currentPage) {
     return;
   }
   state.pages = state.pages.map((page) => (page.id === currentPage.id ? { ...page, ...patch } : page));
   persistState();
-  renderSidebar();
-  renderMainPanel();
-  renderInspector();
+  if (shouldRenderSidebar) {
+    renderSidebar();
+  }
+  if (shouldRenderMainPanel) {
+    renderMainPanel();
+  }
+  if (shouldRenderInspector) {
+    renderInspector();
+  }
 }
 
-function updateCurrentAnnotation(patch) {
+function updateCurrentAnnotation(
+  patch,
+  { renderMainPanel: shouldRenderMainPanel = true, renderInspector: shouldRenderInspector = true } = {}
+) {
   const currentPage = getCurrentPage();
   if (!currentPage) {
     return;
@@ -1043,8 +1249,12 @@ function updateCurrentAnnotation(patch) {
       : page
   );
   persistState();
-  renderMainPanel();
-  renderInspector();
+  if (shouldRenderMainPanel) {
+    renderMainPanel();
+  }
+  if (shouldRenderInspector) {
+    renderInspector();
+  }
 }
 
 function duplicateCurrentAnnotation() {
@@ -1120,38 +1330,79 @@ function setupDrawing() {
 
   let isDrawing = false;
   let startPoint = null;
+  let dragMode = null;
+  let activeAnnotationId = null;
+  let initialBounds = null;
+  let interactionMoved = false;
+  let interactionRect = null;
+  let dragPointerOffset = null;
 
   layer.onpointerdown = (event) => {
-    const hit = event.target.closest(".annotation-box");
-    if (hit) {
-      state.ui.currentAnnotationId = hit.dataset.annotationId;
-      persistState();
-      renderMainPanel();
-      renderInspector();
-      return;
-    }
     if (event.button !== 0) {
       return;
     }
-    const rect = layer.getBoundingClientRect();
-    startPoint = {
-      x: event.clientX - rect.left,
-      y: event.clientY - rect.top,
-    };
+    interactionRect = layer.getBoundingClientRect();
+    const rotateHandle = event.target.closest(".rotate-handle");
+    const resizeHandle = event.target.closest(".resize-handle");
+    const hit = event.target.closest(".annotation-box");
+    if (rotateHandle && hit) {
+      activeAnnotationId = hit.dataset.annotationId;
+      dragMode = "rotate";
+      interactionMoved = false;
+      startPoint = getLayerPoint(event, interactionRect);
+      initialBounds = getAnnotationById(activeAnnotationId);
+      selectAnnotation(activeAnnotationId, { rerenderMainPanel: false, renderInspector: false });
+      layer.setPointerCapture?.(event.pointerId);
+      return;
+    }
+    if (resizeHandle && hit) {
+      activeAnnotationId = hit.dataset.annotationId;
+      dragMode = "resize";
+      interactionMoved = false;
+      startPoint = getLayerPoint(event, interactionRect);
+      initialBounds = getAnnotationById(activeAnnotationId);
+      selectAnnotation(activeAnnotationId, { rerenderMainPanel: false, renderInspector: false });
+      layer.setPointerCapture?.(event.pointerId);
+      return;
+    }
+    if (hit) {
+      activeAnnotationId = hit.dataset.annotationId;
+      dragMode = "move";
+      interactionMoved = false;
+      startPoint = getLayerPoint(event, interactionRect);
+      initialBounds = getAnnotationById(activeAnnotationId);
+      dragPointerOffset = getPointerOffsetWithinElement(hit, event);
+      selectAnnotation(activeAnnotationId, { rerenderMainPanel: false, renderInspector: false });
+      layer.setPointerCapture?.(event.pointerId);
+      return;
+    }
+    startPoint = getLayerPoint(event, interactionRect);
     isDrawing = true;
     draftSelection = { left: startPoint.x, top: startPoint.y, width: 0, height: 0 };
     renderDraftBox(layer);
+    layer.setPointerCapture?.(event.pointerId);
   };
 
   layer.onpointermove = (event) => {
+    if (dragMode && activeAnnotationId && initialBounds && startPoint) {
+      interactionMoved = true;
+      const current = getLayerPoint(event, interactionRect);
+      if (dragMode === "rotate") {
+        const nextAngle = getRotationAngle(initialBounds, current, interactionRect);
+        applyAngleToAnnotationElement(activeAnnotationId, nextAngle);
+        return;
+      }
+      const nextBounds =
+        dragMode === "move"
+          ? getMovedBounds(initialBounds, current, interactionRect, dragPointerOffset)
+          : getResizedBoundsFromTopRight(initialBounds, current, interactionRect);
+      applyBoundsToAnnotationElement(activeAnnotationId, nextBounds);
+      return;
+    }
     if (!isDrawing || !startPoint) {
       return;
     }
-    const rect = layer.getBoundingClientRect();
-    const current = {
-      x: clamp(event.clientX - rect.left, 0, rect.width),
-      y: clamp(event.clientY - rect.top, 0, rect.height),
-    };
+    const current = getLayerPoint(event, interactionRect);
     draftSelection = {
       left: Math.min(startPoint.x, current.x),
       top: Math.min(startPoint.y, current.y),
@@ -1162,14 +1413,34 @@ function setupDrawing() {
   };
 
   const finishDrawing = (event) => {
-    if (!isDrawing || !startPoint) {
+    const rect = interactionRect || layer.getBoundingClientRect();
+    if (dragMode && activeAnnotationId && initialBounds && startPoint) {
+      const current = getLayerPoint(event, rect);
+      if (dragMode === "rotate") {
+        const nextAngle = getRotationAngle(initialBounds, current, rect);
+        commitAnnotationPatch(activeAnnotationId, { lineAngle: nextAngle }, interactionMoved);
+      } else {
+        const nextBounds =
+          dragMode === "move"
+            ? getMovedBounds(initialBounds, current, rect, dragPointerOffset)
+            : getResizedBoundsFromTopRight(initialBounds, current, rect);
+        commitAnnotationPatch(activeAnnotationId, nextBounds, interactionMoved);
+      }
+      dragMode = null;
+      activeAnnotationId = null;
+      initialBounds = null;
+      startPoint = null;
+      interactionMoved = false;
+      interactionRect = null;
+      dragPointerOffset = null;
+      layer.releasePointerCapture?.(event.pointerId);
       return;
     }
-    const rect = layer.getBoundingClientRect();
-    const current = {
-      x: clamp(event.clientX - rect.left, 0, rect.width),
-      y: clamp(event.clientY - rect.top, 0, rect.height),
-    };
+    if (!isDrawing || !startPoint) {
+      interactionRect = null;
+      return;
+    }
+    const current = getLayerPoint(event, rect);
     const width = Math.abs(current.x - startPoint.x);
     const height = Math.abs(current.y - startPoint.y);
     if (width > 8 && height > 8) {
@@ -1185,10 +1456,13 @@ function setupDrawing() {
     isDrawing = false;
     startPoint = null;
     draftSelection = null;
+    interactionRect = null;
     renderDraftBox(layer);
+    layer.releasePointerCapture?.(event.pointerId);
   };
 
   layer.onpointerup = finishDrawing;
+  layer.onpointercancel = finishDrawing;
   layer.onpointerleave = (event) => {
     if (isDrawing) {
       finishDrawing(event);
@@ -1213,6 +1487,7 @@ function addAnnotation(bounds) {
       noteType: "1",
       customGlyphId: "",
       customCode: "",
+      lineAngle: 0,
       ...bounds,
     },
     currentPage.annotations.length
@@ -1246,6 +1521,9 @@ function renderDraftBox(layer) {
 }
 
 function renderAnnotationBox(annotation) {
+  const fillColor = `${annotation.color}44`;
+  const rotation = annotation.markStyle === "underline" ? normalizeAngle(annotation.lineAngle) : 0;
+  const lineLengthPercent = annotation.markStyle === "underline" ? getUnderlineLineLengthPercent(annotation) : 100;
   return `
     <div
       class="annotation-box ${annotation.id === state.ui.currentAnnotationId ? "active" : ""}"
@@ -1256,13 +1534,139 @@ function renderAnnotationBox(annotation) {
         top:${annotation.y * 100}%;
         width:${annotation.width * 100}%;
         height:${annotation.height * 100}%;
-        color:${annotation.color};
+        --annotation-color:${annotation.color};
+        --annotation-fill:${fillColor};
+        --annotation-rotation:${rotation}deg;
+        --annotation-line-length:${lineLengthPercent}%;
       "
       title="${escapeAttribute(annotation.originalText || ANNOTATION_TYPES[annotation.type])}"
     >
+      <span class="annotation-shape"></span>
       <span class="tag">${ANNOTATION_TYPES[annotation.type]}</span>
+      ${annotation.markStyle === "underline" ? `<span class="rotate-handle" title="拖动旋转"></span>` : ""}
+      <span class="resize-handle" title="拖动缩放"></span>
     </div>
   `;
+}
+
+function resolveFrameRect(frame) {
+  return typeof frame?.getBoundingClientRect === "function" ? frame.getBoundingClientRect() : frame;
+}
+
+function getLayerPoint(event, frame) {
+  const rect = resolveFrameRect(frame);
+  return {
+    x: clamp(event.clientX - rect.left, 0, rect.width),
+    y: clamp(event.clientY - rect.top, 0, rect.height),
+  };
+}
+
+function getAnnotationById(annotationId) {
+  const currentPage = getCurrentPage();
+  return currentPage?.annotations.find((annotation) => annotation.id === annotationId) || null;
+}
+
+function selectAnnotation(annotationId, { rerenderMainPanel = true, renderInspector = true, persist = true } = {}) {
+  state.ui.currentAnnotationId = annotationId;
+  if (persist) {
+    persistState();
+  }
+  if (rerenderMainPanel) {
+    renderMainPanel();
+  } else {
+    syncActiveAnnotationElement();
+  }
+  if (renderInspector) {
+    renderInspector();
+  }
+}
+
+function getPointerOffsetWithinElement(element, event) {
+  const elementRect = element.getBoundingClientRect();
+  return {
+    x: event.clientX - elementRect.left,
+    y: event.clientY - elementRect.top,
+  };
+}
+
+function getMovedBounds(annotation, currentPoint, frame, pointerOffset = { x: 0, y: 0 }) {
+  const rect = resolveFrameRect(frame);
+  return {
+    x: clamp((currentPoint.x - pointerOffset.x) / rect.width, 0, Math.max(0, 1 - annotation.width)),
+    y: clamp((currentPoint.y - pointerOffset.y) / rect.height, 0, Math.max(0, 1 - annotation.height)),
+    width: clamp(annotation.width, 0.005, 1),
+    height: clamp(annotation.height, 0.005, 1),
+  };
+}
+
+function getResizedBoundsFromTopRight(annotation, currentPoint, frame) {
+  const rect = resolveFrameRect(frame);
+  const minSize = 12;
+  const leftPx = annotation.x * rect.width;
+  const bottomPx = (annotation.y + annotation.height) * rect.height;
+  const nextRightPx = clamp(currentPoint.x, leftPx + minSize, rect.width);
+  const nextTopPx = clamp(currentPoint.y, 0, bottomPx - minSize);
+  return {
+    x: annotation.x,
+    y: nextTopPx / rect.height,
+    width: (nextRightPx - leftPx) / rect.width,
+    height: (bottomPx - nextTopPx) / rect.height,
+  };
+}
+
+function applyBoundsToAnnotationElement(annotationId, bounds) {
+  const element = document.querySelector(`.annotation-box[data-annotation-id="${annotationId}"]`);
+  if (!element) {
+    return;
+  }
+  element.style.left = `${bounds.x * 100}%`;
+  element.style.top = `${bounds.y * 100}%`;
+  element.style.width = `${bounds.width * 100}%`;
+  element.style.height = `${bounds.height * 100}%`;
+  if (element.dataset.style === "underline") {
+    element.style.setProperty("--annotation-line-length", `${getUnderlineLineLengthPercent(bounds)}%`);
+  }
+}
+
+function syncActiveAnnotationElement() {
+  document.querySelectorAll(".annotation-box").forEach((element) => {
+    element.classList.toggle("active", element.dataset.annotationId === state.ui.currentAnnotationId);
+  });
+}
+
+function applyAngleToAnnotationElement(annotationId, angle) {
+  const element = document.querySelector(`.annotation-box[data-annotation-id="${annotationId}"]`);
+  if (!element) {
+    return;
+  }
+  element.style.setProperty("--annotation-rotation", `${normalizeAngle(angle)}deg`);
+}
+
+function getRotationAngle(annotation, currentPoint, frame) {
+  const rect = resolveFrameRect(frame);
+  const centerX = (annotation.x + annotation.width / 2) * rect.width;
+  const centerY = (annotation.y + annotation.height / 2) * rect.height;
+  const dx = currentPoint.x - centerX;
+  const dy = currentPoint.y - centerY;
+  return normalizeAngle((Math.atan2(dy, dx) * 180) / Math.PI);
+}
+
+function commitAnnotationPatch(annotationId, patch, moved) {
+  state.pages = state.pages.map((page) =>
+    page.id === state.ui.currentPageId
+      ? {
+          ...page,
+          annotations: page.annotations.map((annotation) =>
+            annotation.id === annotationId ? { ...annotation, ...patch } : annotation
+          ),
+        }
+      : page
+  );
+  persistState();
+  if (moved) {
+    renderMainPanel();
+  }
+  renderInspector();
 }
 
 function renderGlyphCard(glyph) {
@@ -1302,6 +1706,20 @@ function persistState() {
 function updateStatus(message, isError = false) {
   elements.statusMessage.textContent = message;
   elements.statusMessage.classList.toggle("danger", isError);
+}
+
+function handleGlobalKeydown(event) {
+  if (event.key !== "Delete") {
+    return;
+  }
+  if (isEditableTarget(event.target)) {
+    return;
+  }
+  if (!state.ui.currentAnnotationId || state.ui.activeTab !== "editor") {
+    return;
+  }
+  event.preventDefault();
+  deleteCurrentAnnotation();
 }
 
 function buildXml(appState) {
@@ -1366,7 +1784,7 @@ function buildXml(appState) {
         lines.push(
           `          <paragraph id="${escapeXml(annotation.id)}" type="0" note="${escapeXml(
             annotation.note
-          )}" data-mark="${escapeXml(annotation.markStyle)}" x1="${round(annotation.x * 100)}" y1="${round(
+          )}" data-mark="${escapeXml(annotation.markStyle)}" angle="${round(annotation.lineAngle)}" x1="${round(annotation.x * 100)}" y1="${round(
             annotation.y * 100
           )}" x2="${round((annotation.x + annotation.width) * 100)}" y2="${round(
             (annotation.y + annotation.height) * 100
@@ -1376,11 +1794,21 @@ function buildXml(appState) {
         lines.push(
           `          <sentence id="${escapeXml(annotation.id)}" type="0" note="${escapeXml(
             annotation.note
-          )}" note_type="${escapeXml(annotation.noteType)}" data-mark="${escapeXml(annotation.markStyle)}" x1="${round(
+          )}" note_type="${escapeXml(annotation.noteType)}" data-mark="${escapeXml(annotation.markStyle)}" angle="${round(annotation.lineAngle)}" x1="${round(
             annotation.x * 100
           )}" y1="${round(annotation.y * 100)}" x2="${round((annotation.x + annotation.width) * 100)}" y2="${round(
             (annotation.y + annotation.height) * 100
           )}" simplified="${escapeXml(annotation.simplifiedText)}">${escapeXml(annotation.originalText)}</sentence>`
+        );
+      } else if (annotation.type === "image") {
+        lines.push(
+          `          <img id="${escapeXml(annotation.id)}" src="" note="${escapeXml(
+            annotation.note
+          )}" name="${escapeXml(annotation.originalText)}" position="${index + 1}" angle="${round(
+            annotation.lineAngle
+          )}" x1="${round(annotation.x * 100)}" y1="${round(annotation.y * 100)}" x2="${round(
+            (annotation.x + annotation.width) * 100
+          )}" y2="${round((annotation.y + annotation.height) * 100)}" />`
         );
       } else {
         const code = resolveAnnotationCode(annotation, appState.glyphs);
@@ -1388,7 +1816,7 @@ function buildXml(appState) {
         lines.push(
           `            <char id="${escapeXml(annotation.id)}" code="${escapeXml(code)}" simplified="${escapeXml(
             annotation.simplifiedText
-          )}" data-mark="${escapeXml(annotation.markStyle)}" x1="${round(annotation.x * 100)}" y1="${round(
+          )}" data-mark="${escapeXml(annotation.markStyle)}" angle="${round(annotation.lineAngle)}" x1="${round(annotation.x * 100)}" y1="${round(
             annotation.y * 100
           )}" x2="${round((annotation.x + annotation.width) * 100)}" y2="${round(
             (annotation.y + annotation.height) * 100
@@ -1427,10 +1855,16 @@ function buildXml(appState) {
       const width = round(annotation.width * (page.width || 1000));
       const height = round(annotation.height * (page.height || 1000));
       if (annotation.markStyle === "underline") {
+        const angle = (normalizeAngle(annotation.lineAngle) * Math.PI) / 180;
+        const centerX = x + width / 2;
+        const centerY = y + height / 2;
+        const lineLength = Math.max(width, height);
+        const dx = Math.cos(angle) * (lineLength / 2);
+        const dy = Math.sin(angle) * (lineLength / 2);
         lines.push(
-          `      <line x1="${x}" y1="${y + height}" x2="${x + width}" y2="${y + height}" stroke="${escapeXml(
+          `      <line x1="${round(centerX - dx)}" y1="${round(centerY - dy)}" x2="${round(centerX + dx)}" y2="${round(centerY + dy)}" stroke="${escapeXml(
             annotation.color
-          )}" />`
+          )}" data-angle="${round(annotation.lineAngle)}" />`
         );
       } else {
         lines.push(
@@ -1439,11 +1873,19 @@ function buildXml(appState) {
           )}" fill="${annotation.markStyle === "highlight" ? escapeXml(`${annotation.color}44`) : "transparent"}" />`
         );
       }
-      lines.push(
-        `      <text x="${x}" y="${Math.max(18, y + 18)}" data-type="${escapeXml(annotation.type)}">${escapeXml(
-          annotation.originalText || ANNOTATION_TYPES[annotation.type]
-        )}</text>`
-      );
+      if (annotation.type === "image") {
+        lines.push(
+          `      <image x="${x}" y="${y}" width="${width}" height="${height}" href="" data-type="image" data-label="${escapeXml(
+            annotation.originalText || ANNOTATION_TYPES[annotation.type]
+          )}" />`
+        );
+      } else {
+        lines.push(
+          `      <text x="${x}" y="${Math.max(18, y + 18)}" data-type="${escapeXml(annotation.type)}">${escapeXml(
+            annotation.originalText || ANNOTATION_TYPES[annotation.type]
+          )}</text>`
+        );
+      }
     });
     lines.push("    </svg>");
   });
@@ -1501,6 +1943,64 @@ function downloadFile(filename, content, mimeType) {
   URL.revokeObjectURL(link.href);
 }
 
+function ensurePdfSupport() {
+  if (pdfjsLib?.getDocument) {
+    return true;
+  }
+  updateStatus("未找到本地 PDF 组件，请确认 vendor/pdfjs 目录里有 pdf.min.js 和 pdf.worker.min.js。", true);
+  return false;
+}
+
+async function importPdfAsPages(file) {
+  const pdfData = await file.arrayBuffer();
+  const task = pdfjsLib.getDocument({ data: pdfData });
+  const pdf = await task.promise;
+  const importedPages = [];
+  const baseTitle = String(file.name || "pdf-import").replace(/\.[^.]+$/, "");
+
+  for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
+    updateStatus(`正在导入 PDF：第 ${pageNumber}/${pdf.numPages} 页...`);
+    await waitForNextFrame();
+
+    const page = await pdf.getPage(pageNumber);
+    const baseViewport = page.getViewport({ scale: 1 });
+    const scale = Math.min(2.2, Math.max(1.25, 1800 / Math.max(baseViewport.width, 1)));
+    const viewport = page.getViewport({ scale });
+    const canvas = document.createElement("canvas");
+    const context = canvas.getContext("2d", { alpha: false });
+
+    canvas.width = Math.ceil(viewport.width);
+    canvas.height = Math.ceil(viewport.height);
+
+    if (!context) {
+      throw new Error("canvas 2d context unavailable");
+    }
+
+    await page.render({ canvasContext: context, viewport }).promise;
+
+    importedPages.push({
+      id: `page-${crypto.randomUUID()}`,
+      title: `${baseTitle} / 第 ${pageNumber} 页`,
+      src: canvas.toDataURL("image/png"),
+      pageNo: state.pages.length + importedPages.length + 1,
+      note: "",
+      direction: viewport.width > viewport.height ? 1 : 0,
+      sourceType: 1,
+      width: canvas.width,
+      height: canvas.height,
+      annotations: [],
+    });
+
+    canvas.width = 0;
+    canvas.height = 0;
+    page.cleanup();
+  }
+
+  pdf.cleanup?.();
+  await task.destroy();
+  return importedPages;
+}
+
 function readFileAsDataUrl(file) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -1526,6 +2026,21 @@ function clamp01(value) {
   return clamp(Number.isFinite(value) ? value : 0, 0, 1);
 }
 
+function normalizeAngle(value) {
+  const num = Number(value);
+  if (!Number.isFinite(num)) {
+    return 0;
+  }
+  const normalized = ((num % 360) + 360) % 360;
+  return normalized;
+}
+
+function getUnderlineLineLengthPercent(bounds) {
+  const baseWidth = Math.max(bounds.width, 0.0001);
+  const diagonal = Math.hypot(bounds.width, bounds.height);
+  return Math.max(100, round((diagonal / baseWidth) * 100));
+}
+
 function round(value) {
   return Number(value.toFixed(2));
 }
@@ -1536,6 +2051,10 @@ function slugify(value) {
     .replace(/\s+/g, "-")
     .replace(/[^\w\u4e00-\u9fa5-]/g, "")
     .toLowerCase();
+}
+
+function waitForNextFrame() {
+  return new Promise((resolve) => requestAnimationFrame(() => resolve()));
 }
 
 function escapeHtml(value) {
@@ -1558,4 +2077,16 @@ function escapeXml(value) {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&apos;");
+}
+
+function isEditableTarget(target) {
+  if (!(target instanceof HTMLElement)) {
+    return false;
+  }
+  return (
+    target.tagName === "INPUT" ||
+    target.tagName === "TEXTAREA" ||
+    target.tagName === "SELECT" ||
+    target.isContentEditable
+  );
 }

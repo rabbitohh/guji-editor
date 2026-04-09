@@ -10,7 +10,6 @@
     <div class="app-shell">
       <header class="topbar">
         <div>
-          <p class="eyebrow">HTML5 + JavaScript</p>
           <h1>古籍 Online Editor</h1>
           <p class="intro">
             面向古籍整理作业的在线编辑器，支持按页标注字句段、造字管理与 XML 导出。
@@ -20,6 +19,7 @@
           <button id="exportXmlButton" class="primary">导出 XML</button>
           <button id="exportJsonButton">导出项目 JSON</button>
           <button id="importJsonButton">导入项目 JSON</button>
+          <button id="newProjectButton">新建项目</button>
           <button id="resetProjectButton">恢复默认样例</button>
         </div>
       </header>
@@ -47,8 +47,10 @@
     </div>
 
     <input id="pageImportInput" type="file" accept="image/*" multiple hidden />
+    <input id="pdfImportInput" type="file" accept=".pdf,application/pdf" hidden />
     <input id="projectImportInput" type="file" accept=".json,application/json" hidden />
 
+    <script src="./vendor/pdfjs/pdf.min.js"></script>
     <script src="./app.js"></script>
   </body>
 </html>
