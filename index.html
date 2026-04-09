@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>古籍 Online Editor</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">HTML5 + JavaScript</p>
+          <h1>古籍 Online Editor</h1>
+          <p class="intro">
+            面向古籍整理作业的在线编辑器，支持按页标注字句段、造字管理与 XML 导出。
+          </p>
+        </div>
+        <div class="top-actions">
+          <button id="exportXmlButton" class="primary">导出 XML</button>
+          <button id="exportJsonButton">导出项目 JSON</button>
+          <button id="importJsonButton">导入项目 JSON</button>
+          <button id="resetProjectButton">恢复默认样例</button>
+        </div>
+      </header>
+
+      <section class="status-strip">
+        <div id="statusSummary"></div>
+        <div id="statusMessage" class="status-message">项目状态会自动保存在浏览器中。</div>
+      </section>
+
+      <nav id="tabBar" class="tab-bar" aria-label="功能分区"></nav>
+
+      <div class="workspace">
+        <aside class="sidebar">
+          <div id="pageSidebar"></div>
+        </aside>
+
+        <main class="main-panel">
+          <div id="mainPanel"></div>
+        </main>
+
+        <aside class="inspector">
+          <div id="inspectorPanel"></div>
+        </aside>
+      </div>
+    </div>
+
+    <input id="pageImportInput" type="file" accept="image/*" multiple hidden />
+    <input id="projectImportInput" type="file" accept=".json,application/json" hidden />
+
+    <script src="./app.js"></script>
+  </body>
+</html>
