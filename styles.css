@@ -169,12 +169,20 @@ h1 {
   gap: 18px;
   margin-top: 18px;
   min-height: 72vh;
+  align-items: stretch;
 }
 
 .sidebar,
 .main-panel,
 .inspector {
   min-width: 0;
+}
+
+.sidebar {
+  align-self: stretch;
+  max-height: 72vh;
+  overflow-y: auto;
+  padding-right: 6px;
 }
 
 .sidebar-card,
@@ -332,6 +340,13 @@ h1 {
 .page-canvas-shell {
   display: grid;
   gap: 16px;
+  min-width: 0;
+}
+
+.canvas-workbench {
+  display: block;
+  min-width: 0;
+  width: 100%;
 }
 
 .tool-panel {
@@ -354,6 +369,10 @@ h1 {
 }
 
 .canvas-wrap {
+  position: relative;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
   border-radius: 28px;
   border: 1px solid rgba(168, 142, 99, 0.25);
   background:
@@ -361,20 +380,36 @@ h1 {
     #e8dcc1;
   padding: 18px;
   overflow: auto;
+  height: clamp(480px, 68vh, 820px);
   min-height: 480px;
+  cursor: default;
+}
+
+.canvas-wrap.is-panning {
+  cursor: grabbing;
+}
+
+.canvas-viewport {
+  position: relative;
+  display: block;
+  max-width: none;
+  min-width: 0;
+  min-width: 1px;
+  min-height: 1px;
+  overflow: hidden;
 }
 
 .canvas-stage {
   position: relative;
-  display: inline-block;
-  min-width: min(100%, 320px);
-  max-width: 100%;
+  display: block;
   user-select: none;
+  transform-origin: top left;
+  will-change: transform;
 }
 
 .canvas-stage img {
   display: block;
-  max-width: min(100%, 980px);
+  max-width: none;
   width: 100%;
   height: auto;
   border-radius: 18px;
@@ -442,11 +477,14 @@ h1 {
   position: absolute;
   top: -12px;
   left: 0;
+  display: inline-flex;
+  align-items: center;
   padding: 2px 8px;
   border-radius: 999px;
   background: white;
   color: #1f170d;
   font-size: 12px;
+  line-height: 1.35;
   white-space: nowrap;
   border: 1px solid rgba(44, 36, 24, 0.18);
   box-shadow: 0 4px 10px rgba(44, 36, 24, 0.18);
@@ -538,6 +576,47 @@ h1 {
 .annotation-list {
   display: grid;
   gap: 10px;
+}
+
+.zoom-rail {
+  border: 1px solid rgba(168, 142, 99, 0.25);
+  background: rgba(255, 251, 243, 0.92);
+  border-radius: 22px;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.5);
+}
+
+.zoom-rail-horizontal {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 14px;
+}
+
+.zoom-caption {
+  color: var(--muted);
+  font-size: 13px;
+  min-width: 52px;
+}
+
+.zoom-value {
+  min-width: 58px;
+  text-align: center;
+  color: var(--accent);
+}
+
+.zoom-slider {
+  flex: 1;
+  min-width: 120px;
+  accent-color: var(--accent);
+}
+
+.zoom-nudge {
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border-radius: 50%;
+  font-size: 18px;
+  line-height: 1;
 }
 
 .annotation-row {
@@ -663,12 +742,23 @@ h1 {
     grid-template-columns: 1fr;
   }
 
+  .sidebar {
+    max-height: none;
+    overflow: visible;
+    padding-right: 0;
+  }
+
   .field-grid {
     grid-template-columns: 1fr;
   }
 
   .canvas-wrap {
+    height: 320px;
     min-height: 320px;
     padding: 12px;
+  }
+
+  .zoom-rail-horizontal {
+    flex-wrap: wrap;
   }
 }

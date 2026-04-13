@@ -1,6 +1,7 @@
-const pdfjsLib = window.pdfjsLib || null;
+import * as pdfjsLib from "./vendor/pdfjs/pdf.mjs";
+
 if (pdfjsLib?.GlobalWorkerOptions) {
-  pdfjsLib.GlobalWorkerOptions.workerSrc = "./vendor/pdfjs/pdf.worker.min.js";
+  pdfjsLib.GlobalWorkerOptions.workerSrc = "./vendor/pdfjs/pdf.worker.mjs";
 }
 
 const SAMPLE_PAGES = [
@@ -62,6 +63,10 @@ const NOTE_TYPES = {
   4: "批注",
 };
 
+const CANVAS_ZOOM_MIN = 0.5;
+const CANVAS_ZOOM_MAX = 3;
+const CANVAS_ZOOM_STEP = 0.05;
+
 const elements = {
   statusSummary: document.getElementById("statusSummary"),
   statusMessage: document.getElementById("statusMessage"),
@@ -85,6 +90,7 @@ let draggedPageId = null;
 
 renderAll();
 bindGlobalEvents();
+showRuntimeHint();
 
 function createDefaultState() {
   const pages = SAMPLE_PAGES.map((page, index) => ({
@@ -126,6 +132,7 @@ function createDefaultState() {
       drawType: "char",
       drawStyle: "box",
       editingGlyphId: null,
+      canvasZoom: 1,
     },
   };
 }
@@ -157,6 +164,7 @@ function createEmptyState() {
       drawType: "char",
       drawStyle: "box",
       editingGlyphId: null,
+      canvasZoom: 1,
     },
   };
 }
@@ -224,6 +232,7 @@ function normalizeState(raw, fallback = createDefaultState()) {
       drawType: raw?.ui?.drawType && ANNOTATION_TYPES[raw.ui.drawType] ? raw.ui.drawType : "char",
       drawStyle: raw?.ui?.drawStyle && STYLE_LABELS[raw.ui.drawStyle] ? raw.ui.drawStyle : "box",
       editingGlyphId: glyphs.some((glyph) => glyph.id === raw?.ui?.editingGlyphId) ? raw.ui.editingGlyphId : null,
+      canvasZoom: clamp(Number(raw?.ui?.canvasZoom) || 1, CANVAS_ZOOM_MIN, CANVAS_ZOOM_MAX),
     },
   };
 }
@@ -358,11 +367,12 @@ function bindGlobalEvents() {
       updateStatus(`已导入 PDF：${file.name}，共 ${importedPages.length} 页。`);
     } catch (error) {
       console.error("import pdf failed", error);
-      updateStatus("PDF 导入失败，请确认本地 pdf.min.js 和 pdf.worker.min.js 已放到 vendor/pdfjs 目录。", true);
+      updateStatus("PDF 导入失败，请确认本地 pdf.mjs 和 pdf.worker.mjs 已放到 vendor/pdfjs 目录。", true);
     }
   });
 
   document.addEventListener("keydown", handleGlobalKeydown);
+  window.addEventListener("resize", syncCanvasZoomLayout);
 }
 
 function renderAll() {
@@ -570,6 +580,7 @@ function renderEditorPanel() {
     elements.mainPanel.innerHTML = `<div class="main-card"><div class="empty-state">当前没有可编辑页面。</div></div>`;
     return;
   }
+  const zoomPercent = Math.round(getCanvasZoom() * 100);
 
   elements.mainPanel.innerHTML = `
     <div class="main-card page-canvas-shell">
@@ -593,13 +604,33 @@ function renderEditorPanel() {
             .join("")}
         </div>
       </div>
-      <div class="canvas-wrap">
-        <div class="canvas-stage" id="canvasStage">
-          <img id="pageImage" src="${currentPage.src}" alt="${escapeHtml(currentPage.title)}" />
-          <div class="annotation-layer" id="annotationLayer">
-            ${currentPage.annotations.map((annotation) => renderAnnotationBox(annotation)).join("")}
+      <div class="canvas-workbench">
+        <div class="canvas-wrap" id="canvasWrap">
+          <div class="canvas-viewport" id="canvasViewport">
+            <div class="canvas-stage" id="canvasStage">
+              <img id="pageImage" src="${currentPage.src}" alt="${escapeHtml(currentPage.title)}" />
+              <div class="annotation-layer" id="annotationLayer">
+                ${currentPage.annotations.map((annotation) => renderAnnotationBox(annotation)).join("")}
+              </div>
+            </div>
           </div>
         </div>
+      </div>
+      <div class="zoom-rail zoom-rail-horizontal">
+        <span class="zoom-caption">缩放尺</span>
+        <button type="button" class="zoom-nudge" data-zoom-delta="-0.1">-</button>
+        <input
+          id="zoomSliderHorizontal"
+          class="zoom-slider"
+          type="range"
+          min="${Math.round(CANVAS_ZOOM_MIN * 100)}"
+          max="${Math.round(CANVAS_ZOOM_MAX * 100)}"
+          step="${Math.round(CANVAS_ZOOM_STEP * 100)}"
+          value="${zoomPercent}"
+        />
+        <button type="button" class="zoom-nudge" data-zoom-delta="0.1">+</button>
+        <strong class="zoom-value" id="zoomValue">${zoomPercent}%</strong>
+        <button type="button" id="zoomResetButton" class="ghost">100%</button>
       </div>
       <div class="annotation-list">
         ${
@@ -655,15 +686,191 @@ function renderEditorPanel() {
     });
   });
 
+  bindCanvasZoomControls();
+  bindCanvasPanControls();
+  syncCanvasZoomControls();
+
   const pageImage = document.getElementById("pageImage");
   pageImage.addEventListener("load", () => {
     updatePageDimensions(pageImage.naturalWidth, pageImage.naturalHeight);
+    syncCanvasZoomLayout();
     setupDrawing();
   });
   if (pageImage.complete) {
     updatePageDimensions(pageImage.naturalWidth, pageImage.naturalHeight);
+    syncCanvasZoomLayout();
     setupDrawing();
   }
+}
+
+function bindCanvasZoomControls() {
+  const horizontalSlider = document.getElementById("zoomSliderHorizontal");
+  const sliders = [horizontalSlider].filter(Boolean);
+
+  sliders.forEach((slider) => {
+    slider.addEventListener("input", (event) => {
+      setCanvasZoom(Number(event.target.value) / 100, { persist: false });
+    });
+    slider.addEventListener("change", () => {
+      persistState();
+    });
+  });
+
+  document.querySelectorAll("[data-zoom-delta]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const delta = Number(button.dataset.zoomDelta) || 0;
+      setCanvasZoom(getCanvasZoom() + delta);
+    });
+  });
+
+  document.getElementById("zoomResetButton")?.addEventListener("click", () => {
+    setCanvasZoom(1);
+  });
+}
+
+function getCanvasZoom() {
+  return clamp(Number(state.ui.canvasZoom) || 1, CANVAS_ZOOM_MIN, CANVAS_ZOOM_MAX);
+}
+
+function setCanvasZoom(value, { persist = true } = {}) {
+  const nextZoom = clamp(Number(value) || 1, CANVAS_ZOOM_MIN, CANVAS_ZOOM_MAX);
+  state.ui.canvasZoom = round(nextZoom);
+  if (persist) {
+    persistState();
+  }
+  syncCanvasZoomControls();
+  syncCanvasZoomLayout();
+}
+
+function syncCanvasZoomControls() {
+  const zoomPercent = Math.round(getCanvasZoom() * 100);
+  document.getElementById("zoomSliderHorizontal")?.setAttribute("value", String(zoomPercent));
+
+  const horizontalSlider = document.getElementById("zoomSliderHorizontal");
+  if (horizontalSlider) {
+    horizontalSlider.value = String(zoomPercent);
+  }
+  const zoomValue = document.getElementById("zoomValue");
+  if (zoomValue) {
+    zoomValue.textContent = `${zoomPercent}%`;
+  }
+}
+
+function syncCanvasZoomLayout() {
+  const stage = document.getElementById("canvasStage");
+  const viewport = document.getElementById("canvasViewport");
+  const canvasWrap = document.getElementById("canvasWrap");
+  const pageImage = document.getElementById("pageImage");
+  if (!stage || !viewport || !canvasWrap || !pageImage?.naturalWidth || !pageImage?.naturalHeight) {
+    return;
+  }
+  const zoom = getCanvasZoom();
+  const { width: baseWidth, height: baseHeight, innerWidth, innerHeight } = getCanvasBaseSize(pageImage, canvasWrap);
+  const viewportWidth = Math.max(1, Math.round(baseWidth * zoom));
+  const viewportHeight = Math.max(1, Math.round(baseHeight * zoom));
+  stage.style.width = `${baseWidth}px`;
+  stage.style.height = `${baseHeight}px`;
+  stage.style.transform = `scale(${zoom})`;
+  stage.style.transformOrigin = "top left";
+  viewport.style.width = `${viewportWidth}px`;
+  viewport.style.height = `${viewportHeight}px`;
+
+  const maxScrollLeft = Math.max(0, viewportWidth - innerWidth);
+  const maxScrollTop = Math.max(0, viewportHeight - innerHeight);
+  if (zoom <= 1) {
+    canvasWrap.scrollLeft = 0;
+    canvasWrap.scrollTop = 0;
+    return;
+  }
+  canvasWrap.scrollLeft = clamp(canvasWrap.scrollLeft, 0, maxScrollLeft);
+  canvasWrap.scrollTop = clamp(canvasWrap.scrollTop, 0, maxScrollTop);
+}
+
+function getCanvasBaseSize(pageImage, canvasWrap) {
+  const wrapStyle = window.getComputedStyle(canvasWrap);
+  const paddingX = Number.parseFloat(wrapStyle.paddingLeft || "0") + Number.parseFloat(wrapStyle.paddingRight || "0");
+  const paddingY = Number.parseFloat(wrapStyle.paddingTop || "0") + Number.parseFloat(wrapStyle.paddingBottom || "0");
+  const innerWidth = Math.max(1, Math.floor(canvasWrap.clientWidth - paddingX));
+  const innerHeight = Math.max(1, Math.floor(canvasWrap.clientHeight - paddingY));
+  const naturalWidth = pageImage.naturalWidth;
+  const naturalHeight = pageImage.naturalHeight;
+  const fittedWidth = Math.min(naturalWidth, 980, innerWidth);
+  const scale = fittedWidth / Math.max(1, naturalWidth);
+  return {
+    width: Math.max(1, Math.round(fittedWidth)),
+    height: Math.max(1, Math.round(naturalHeight * scale)),
+    innerWidth,
+    innerHeight,
+  };
+}
+
+function bindCanvasPanControls() {
+  const canvasWrap = document.getElementById("canvasWrap");
+  if (!canvasWrap) {
+    return;
+  }
+
+  let isPanning = false;
+  let pointerId = null;
+  let startClientX = 0;
+  let startClientY = 0;
+  let startScrollLeft = 0;
+  let startScrollTop = 0;
+
+  const endPan = () => {
+    isPanning = false;
+    pointerId = null;
+    canvasWrap.classList.remove("is-panning");
+  };
+
+  canvasWrap.addEventListener("contextmenu", (event) => {
+    event.preventDefault();
+  });
+
+  canvasWrap.addEventListener("pointerdown", (event) => {
+    if (event.button !== 2) {
+      return;
+    }
+    isPanning = true;
+    pointerId = event.pointerId;
+    startClientX = event.clientX;
+    startClientY = event.clientY;
+    startScrollLeft = canvasWrap.scrollLeft;
+    startScrollTop = canvasWrap.scrollTop;
+    canvasWrap.classList.add("is-panning");
+    canvasWrap.setPointerCapture?.(event.pointerId);
+    event.preventDefault();
+  });
+
+  canvasWrap.addEventListener("pointermove", (event) => {
+    if (!isPanning || event.pointerId !== pointerId) {
+      return;
+    }
+    const deltaX = event.clientX - startClientX;
+    const deltaY = event.clientY - startClientY;
+    canvasWrap.scrollLeft = startScrollLeft - deltaX;
+    canvasWrap.scrollTop = startScrollTop - deltaY;
+    event.preventDefault();
+  });
+
+  canvasWrap.addEventListener("pointerup", (event) => {
+    if (event.pointerId !== pointerId) {
+      return;
+    }
+    canvasWrap.releasePointerCapture?.(event.pointerId);
+    endPan();
+  });
+
+  canvasWrap.addEventListener("pointercancel", (event) => {
+    if (event.pointerId !== pointerId) {
+      return;
+    }
+    endPan();
+  });
+
+  canvasWrap.addEventListener("lostpointercapture", () => {
+    endPan();
+  });
 }
 
 function renderGlyphPanel() {
@@ -961,6 +1168,7 @@ function renderEditorInspector() {
   const annotationForm = document.getElementById("annotationForm");
   if (annotationForm) {
     annotationForm.addEventListener("input", handleAnnotationInput);
+    document.getElementById("generateGlyphButton")?.addEventListener("click", createGlyphFromCurrentAnnotation);
     document.getElementById("duplicateAnnotationButton")?.addEventListener("click", duplicateCurrentAnnotation);
     document.getElementById("deleteAnnotationButton")?.addEventListener("click", deleteCurrentAnnotation);
   }
@@ -1113,6 +1321,16 @@ function renderAnnotationForm(annotation) {
                     )
                     .join("")}
                 </select>
+              </div>
+            `
+        }
+        ${
+          annotation.type !== "char"
+            ? ""
+            : `
+              <div class="field-block">
+                <label>&nbsp;</label>
+                <button id="generateGlyphButton" type="button">一键造字</button>
               </div>
             `
         }
@@ -1295,6 +1513,56 @@ function deleteCurrentAnnotation() {
   updateStatus("已删除当前标注。");
 }
 
+async function createGlyphFromCurrentAnnotation() {
+  const currentPage = getCurrentPage();
+  const annotation = getCurrentAnnotation();
+  if (!currentPage || !annotation) {
+    return;
+  }
+  if (annotation.type !== "char") {
+    updateStatus("只有“字”类型标注支持一键造字。", true);
+    return;
+  }
+
+  try {
+    updateStatus("正在根据当前框选生成字型图...");
+    const pageImage = await getPageImageForGlyph(currentPage);
+    const imageDataUrl = cropAnnotationToDataUrl(pageImage, annotation);
+    const linkedGlyph = annotation.customGlyphId
+      ? state.glyphs.find((glyph) => glyph.id === annotation.customGlyphId) || null
+      : null;
+    const glyph = {
+      id: linkedGlyph?.id || `glyph-${crypto.randomUUID()}`,
+      unicode: linkedGlyph?.unicode || nextPrivateUnicode(state.glyphs),
+      traditional: annotation.originalText || linkedGlyph?.traditional || "",
+      simplified: annotation.simplifiedText || linkedGlyph?.simplified || "",
+      description:
+        linkedGlyph?.description ||
+        `第 ${currentPage.pageNo} 页框选生成${currentPage.title ? `：${currentPage.title}` : ""}`,
+      imageDataUrl,
+    };
+
+    state.glyphs = upsertById(state.glyphs, glyph);
+    state.pages = state.pages.map((page) =>
+      page.id === currentPage.id
+        ? {
+            ...page,
+            annotations: page.annotations.map((item) =>
+              item.id === annotation.id ? { ...item, customGlyphId: glyph.id } : item
+            ),
+          }
+        : page
+    );
+    state.ui.editingGlyphId = glyph.id;
+    persistState();
+    renderAll();
+    updateStatus(`已生成造字 ${glyph.unicode}，并关联到当前框选。`);
+  } catch (error) {
+    console.error("generate glyph failed", error);
+    updateStatus("一键造字失败，请确认当前页面图片已正常加载。", true);
+  }
+}
+
 function removeCurrentPage() {
   const currentPage = getCurrentPage();
   if (!currentPage || state.pages.length === 1) {
@@ -1341,7 +1609,7 @@ function setupDrawing() {
     if (event.button !== 0) {
       return;
     }
-    interactionRect = layer.getBoundingClientRect();
+    interactionRect = createInteractionFrame(layer);
     const rotateHandle = event.target.closest(".rotate-handle");
     const resizeHandle = event.target.closest(".resize-handle");
     const hit = event.target.closest(".annotation-box");
@@ -1413,7 +1681,7 @@ function setupDrawing() {
   };
 
   const finishDrawing = (event) => {
-    const rect = interactionRect || layer.getBoundingClientRect();
+    const rect = interactionRect || createInteractionFrame(layer);
     if (dragMode && activeAnnotationId && initialBounds && startPoint) {
       const current = getLayerPoint(event, rect);
       if (dragMode === "rotate") {
@@ -1549,15 +1817,40 @@ function renderAnnotationBox(annotation) {
   `;
 }
 
-function resolveFrameRect(frame) {
-  return typeof frame?.getBoundingClientRect === "function" ? frame.getBoundingClientRect() : frame;
+function createInteractionFrame(layer) {
+  const rect = layer.getBoundingClientRect();
+  return {
+    rect,
+    width: layer.offsetWidth || layer.clientWidth || rect.width,
+    height: layer.offsetHeight || layer.clientHeight || rect.height,
+  };
+}
+
+function resolveFrameMetrics(frame) {
+  if (frame?.rect) {
+    return {
+      rect: frame.rect,
+      width: frame.width ?? frame.rect.width,
+      height: frame.height ?? frame.rect.height,
+    };
+  }
+  const rect = typeof frame?.getBoundingClientRect === "function" ? frame.getBoundingClientRect() : frame;
+  return {
+    rect,
+    width: frame?.offsetWidth || frame?.clientWidth || rect.width,
+    height: frame?.offsetHeight || frame?.clientHeight || rect.height,
+  };
 }
 
 function getLayerPoint(event, frame) {
-  const rect = resolveFrameRect(frame);
+  const metrics = resolveFrameMetrics(frame);
+  const width = Math.max(1, metrics.width);
+  const height = Math.max(1, metrics.height);
+  const rectWidth = Math.max(1, metrics.rect.width);
+  const rectHeight = Math.max(1, metrics.rect.height);
   return {
-    x: clamp(event.clientX - rect.left, 0, rect.width),
-    y: clamp(event.clientY - rect.top, 0, rect.height),
+    x: clamp(((event.clientX - metrics.rect.left) / rectWidth) * width, 0, width),
+    y: clamp(((event.clientY - metrics.rect.top) / rectHeight) * height, 0, height),
   };
 }
 
@@ -1583,14 +1876,16 @@ function selectAnnotation(annotationId, { rerenderMainPanel = true, renderInspec
 
 function getPointerOffsetWithinElement(element, event) {
   const elementRect = element.getBoundingClientRect();
+  const width = element.offsetWidth || element.clientWidth || elementRect.width;
+  const height = element.offsetHeight || element.clientHeight || elementRect.height;
   return {
-    x: event.clientX - elementRect.left,
-    y: event.clientY - elementRect.top,
+    x: clamp(((event.clientX - elementRect.left) / Math.max(1, elementRect.width)) * width, 0, width),
+    y: clamp(((event.clientY - elementRect.top) / Math.max(1, elementRect.height)) * height, 0, height),
   };
 }
 
 function getMovedBounds(annotation, currentPoint, frame, pointerOffset = { x: 0, y: 0 }) {
-  const rect = resolveFrameRect(frame);
+  const rect = resolveFrameMetrics(frame);
   return {
     x: clamp((currentPoint.x - pointerOffset.x) / rect.width, 0, Math.max(0, 1 - annotation.width)),
     y: clamp((currentPoint.y - pointerOffset.y) / rect.height, 0, Math.max(0, 1 - annotation.height)),
@@ -1600,7 +1895,7 @@ function getMovedBounds(annotation, currentPoint, frame, pointerOffset = { x: 0,
 }
 
 function getResizedBoundsFromTopRight(annotation, currentPoint, frame) {
-  const rect = resolveFrameRect(frame);
+  const rect = resolveFrameMetrics(frame);
   const minSize = 12;
   const leftPx = annotation.x * rect.width;
   const bottomPx = (annotation.y + annotation.height) * rect.height;
@@ -1643,7 +1938,7 @@ function applyAngleToAnnotationElement(annotationId, angle) {
 }
 
 function getRotationAngle(annotation, currentPoint, frame) {
-  const rect = resolveFrameRect(frame);
+  const rect = resolveFrameMetrics(frame);
   const centerX = (annotation.x + annotation.width / 2) * rect.width;
   const centerY = (annotation.y + annotation.height / 2) * rect.height;
   const dx = currentPoint.x - centerX;
@@ -1706,6 +2001,12 @@ function persistState() {
 function updateStatus(message, isError = false) {
   elements.statusMessage.textContent = message;
   elements.statusMessage.classList.toggle("danger", isError);
+}
+
+function showRuntimeHint() {
+  if (window.location.protocol === "file:") {
+    updateStatus("建议用 start-local-server.bat 启动后访问 http://127.0.0.1:8000/index.html，以保证 PDF 导入和本地资源正常工作。", true);
+  }
 }
 
 function handleGlobalKeydown(event) {
@@ -1903,7 +2204,7 @@ function buildXml(appState) {
     lines.push(
       `    <glyph unicode="${escapeXml(glyph.unicode)}" traditional="${escapeXml(
         glyph.traditional
-      )}" simplified="${escapeXml(glyph.simplified)}" image="${escapeXml(glyph.imageDataUrl || "")}">${escapeXml(
+      )}" simplified="${escapeXml(glyph.simplified)}" image="${escapeXml(serializeGlyphImageForXml(glyph.imageDataUrl))}">${escapeXml(
         glyph.description
       )}</glyph>`
     );
@@ -1947,7 +2248,7 @@ function ensurePdfSupport() {
   if (pdfjsLib?.getDocument) {
     return true;
   }
-  updateStatus("未找到本地 PDF 组件，请确认 vendor/pdfjs 目录里有 pdf.min.js 和 pdf.worker.min.js。", true);
+  updateStatus("未找到本地 PDF 组件，请确认 vendor/pdfjs 目录里有 pdf.mjs 和 pdf.worker.mjs。", true);
   return false;
 }
 
@@ -2008,6 +2309,61 @@ function readFileAsDataUrl(file) {
     reader.onerror = () => reject(reader.error);
     reader.readAsDataURL(file);
   });
+}
+
+function getPageImageForGlyph(page) {
+  const currentPage = getCurrentPage();
+  const liveImage =
+    currentPage?.id === page.id && state.ui.activeTab === "editor" ? document.getElementById("pageImage") : null;
+  if (liveImage?.complete && liveImage.naturalWidth && liveImage.naturalHeight) {
+    return Promise.resolve(liveImage);
+  }
+
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => resolve(image);
+    image.onerror = () => reject(new Error("page image load failed"));
+    image.src = page.src;
+  });
+}
+
+function cropAnnotationToDataUrl(image, annotation) {
+  const imageWidth = image.naturalWidth || image.width;
+  const imageHeight = image.naturalHeight || image.height;
+  if (!imageWidth || !imageHeight) {
+    throw new Error("page image size unavailable");
+  }
+
+  const left = clamp(Math.floor(annotation.x * imageWidth), 0, Math.max(0, imageWidth - 1));
+  const top = clamp(Math.floor(annotation.y * imageHeight), 0, Math.max(0, imageHeight - 1));
+  const right = clamp(Math.ceil((annotation.x + annotation.width) * imageWidth), left + 1, imageWidth);
+  const bottom = clamp(Math.ceil((annotation.y + annotation.height) * imageHeight), top + 1, imageHeight);
+  const cropWidth = Math.max(1, right - left);
+  const cropHeight = Math.max(1, bottom - top);
+
+  const canvas = document.createElement("canvas");
+  canvas.width = cropWidth;
+  canvas.height = cropHeight;
+  const context = canvas.getContext("2d");
+  if (!context) {
+    throw new Error("canvas 2d context unavailable");
+  }
+
+  context.drawImage(image, left, top, cropWidth, cropHeight, 0, 0, cropWidth, cropHeight);
+  return canvas.toDataURL("image/png");
+}
+
+function serializeGlyphImageForXml(imageDataUrl) {
+  if (!imageDataUrl) {
+    return "";
+  }
+  const value = String(imageDataUrl);
+  const base64Index = value.indexOf("base64,");
+  if (base64Index !== -1) {
+    return value.slice(base64Index + 7);
+  }
+  const commaIndex = value.indexOf(",");
+  return commaIndex !== -1 ? value.slice(commaIndex + 1) : value;
 }
 
 function upsertById(items, nextItem) {
