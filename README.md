@@ -22,6 +22,22 @@ python -m http.server 8000
 
 然后访问 `http://localhost:8000/index.html`。
 
+## 百度 OCR 接入
+
+项目已经内置本地 OCR 代理，前端会请求同源接口 `/api/ocr/page`，避免把百度云密钥暴露到浏览器里。
+
+启动前先在 PowerShell 里设置环境变量：
+
+```powershell
+$env:BAIDU_OCR_API_KEY = "your-api-key"
+$env:BAIDU_OCR_SECRET_KEY = "your-secret-key"
+.\scripts\serve-local.ps1 -Port 8000
+```
+
+进入编辑页后，点击工具栏里的“当前页 OCR”即可把识别结果自动写入当前页标注。
+
+如果你直接双击 `start-local-server.bat`，脚本也会在缺少密钥时提示输入；或者你可以复制 `start-local-server.env.example.bat` 为 `start-local-server.env.bat` 后填写密钥。
+
 ## 主要文件
 
 - `index.html`：页面结构

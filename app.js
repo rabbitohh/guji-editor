@@ -66,6 +66,14 @@ const NOTE_TYPES = {
 const CANVAS_ZOOM_MIN = 0.5;
 const CANVAS_ZOOM_MAX = 3;
 const CANVAS_ZOOM_STEP = 0.05;
+const ANNOTATION_MIN_SIZE_PX = 8;
+const UNDERLINE_MIN_LENGTH_PX = 8;
+const UNDERLINE_DRAG_TOLERANCE_PX = 5;
+const UNDERLINE_MIN_THICKNESS_PX = 2;
+const UNDERLINE_COMPONENT_EPSILON = 0.000001;
+const OCR_SELECTION_PADDING_RATIO = 0.15;
+const OCR_SOURCE_BAIDU_PAGE = "baidu-ocr-page";
+const OCR_SOURCE_BAIDU_SELECTION = "baidu-ocr-selection";
 
 const elements = {
   statusSummary: document.getElementById("statusSummary"),
@@ -87,6 +95,7 @@ const elements = {
 let state = loadState();
 let draftSelection = null;
 let draggedPageId = null;
+let ocrRequestInFlight = false;
 
 renderAll();
 bindGlobalEvents();
@@ -242,6 +251,10 @@ function normalizeAnnotation(annotation, order) {
   const y = clamp01(Number(annotation.y) || 0);
   const width = clamp01(Number(annotation.width) || 0.1);
   const height = clamp01(Number(annotation.height) || 0.1);
+  const lineStartX = Number.isFinite(Number(annotation.lineStartX)) ? clamp01(Number(annotation.lineStartX)) : null;
+  const lineStartY = Number.isFinite(Number(annotation.lineStartY)) ? clamp01(Number(annotation.lineStartY)) : null;
+  const lineEndX = Number.isFinite(Number(annotation.lineEndX)) ? clamp01(Number(annotation.lineEndX)) : null;
+  const lineEndY = Number.isFinite(Number(annotation.lineEndY)) ? clamp01(Number(annotation.lineEndY)) : null;
   return {
     id: annotation.id || `annotation-${Date.now()}-${order}`,
     type: ANNOTATION_TYPES[annotation.type] ? annotation.type : "char",
@@ -258,6 +271,12 @@ function normalizeAnnotation(annotation, order) {
     y,
     width,
     height,
+    lineStartX,
+    lineStartY,
+    lineEndX,
+    lineEndY,
+    source: annotation.source || "",
+    ocrConfidence: Number.isFinite(Number(annotation.ocrConfidence)) ? Number(annotation.ocrConfidence) : null,
   };
 }
 
@@ -603,6 +622,11 @@ function renderEditorPanel() {
             )
             .join("")}
         </div>
+        <div class="tool-group">
+          <span>OCR</span>
+          <button type="button" id="runOcrButton" class="ghost">Page OCR</button>
+          <button type="button" id="clearOcrButton" class="ghost">Clear OCR</button>
+        </div>
       </div>
       <div class="canvas-workbench">
         <div class="canvas-wrap" id="canvasWrap">
@@ -610,7 +634,7 @@ function renderEditorPanel() {
             <div class="canvas-stage" id="canvasStage">
               <img id="pageImage" src="${currentPage.src}" alt="${escapeHtml(currentPage.title)}" />
               <div class="annotation-layer" id="annotationLayer">
-                ${currentPage.annotations.map((annotation) => renderAnnotationBox(annotation)).join("")}
+                ${currentPage.annotations.map((annotation) => renderAnnotationBox(annotation, currentPage)).join("")}
               </div>
             </div>
           </div>
@@ -675,6 +699,14 @@ function renderEditorPanel() {
       renderMainPanel();
       renderSidebar();
     });
+  });
+
+  document.getElementById("runOcrButton")?.addEventListener("click", () => {
+    runOcrForCurrentPage();
+  });
+
+  document.getElementById("clearOcrButton")?.addEventListener("click", () => {
+    clearOcrAnnotationsForCurrentPage();
   });
 
   elements.mainPanel.querySelectorAll("[data-annotation-id]").forEach((row) => {
@@ -1168,6 +1200,10 @@ function renderEditorInspector() {
   const annotationForm = document.getElementById("annotationForm");
   if (annotationForm) {
     annotationForm.addEventListener("input", handleAnnotationInput);
+    document.getElementById("recognizeAnnotationButton")?.addEventListener("click", () => {
+      runOcrForCurrentAnnotation();
+    });
+    document.getElementById("lookupDictionaryButton")?.addEventListener("click", lookupAncientDictionaryForCurrentAnnotation);
     document.getElementById("generateGlyphButton")?.addEventListener("click", createGlyphFromCurrentAnnotation);
     document.getElementById("duplicateAnnotationButton")?.addEventListener("click", duplicateCurrentAnnotation);
     document.getElementById("deleteAnnotationButton")?.addEventListener("click", deleteCurrentAnnotation);
@@ -1299,6 +1335,16 @@ function renderAnnotationForm(annotation) {
             ? ""
             : `
               <div class="field-block full">
+                <label>&nbsp;</label>
+                <button id="recognizeAnnotationButton" type="button">OCR Fill Original</button>
+              </div>
+            `
+        }
+        ${
+          annotation.type === "image"
+            ? ""
+            : `
+              <div class="field-block full">
                 <label for="annotationSimplified">简体录入</label>
                 <input id="annotationSimplified" name="simplifiedText" value="${escapeAttribute(annotation.simplifiedText)}" placeholder="输入对应的简体内容" />
               </div>
@@ -1328,6 +1374,10 @@ function renderAnnotationForm(annotation) {
           annotation.type !== "char"
             ? ""
             : `
+              <div class="field-block">
+                <label>&nbsp;</label>
+                <button id="lookupDictionaryButton" type="button">\u67e5\u8be2\u53e4\u6c49\u8bed\u8bcd\u5178</button>
+              </div>
               <div class="field-block">
                 <label>&nbsp;</label>
                 <button id="generateGlyphButton" type="button">一键造字</button>
@@ -1397,6 +1447,7 @@ function handlePageInput(event) {
 
 function handleAnnotationInput(event) {
   const annotation = getCurrentAnnotation();
+  const currentPage = getCurrentPage();
   if (!annotation) {
     return;
   }
@@ -1406,8 +1457,12 @@ function handleAnnotationInput(event) {
   } else if (event.target.name === "lineAngle") {
     value = normalizeAngle(value);
   }
+  let patch = { [event.target.name]: value };
+  if (annotation.markStyle === "underline" && currentPage && ["x", "y", "width", "height", "lineAngle"].includes(event.target.name)) {
+    patch = getUpdatedUnderlineGeometryPatch(annotation, patch, currentPage);
+  }
   updateCurrentAnnotation(
-    { [event.target.name]: value },
+    patch,
     {
       renderMainPanel: [
         "type",
@@ -1481,11 +1536,17 @@ function duplicateCurrentAnnotation() {
   if (!currentPage || !annotation) {
     return;
   }
+  const offsetX = clamp01(annotation.x + 0.01) - annotation.x;
+  const offsetY = clamp01(annotation.y + 0.01) - annotation.y;
   const duplicate = {
     ...annotation,
     id: `annotation-${crypto.randomUUID()}`,
-    x: clamp01(annotation.x + 0.01),
-    y: clamp01(annotation.y + 0.01),
+    x: annotation.x + offsetX,
+    y: annotation.y + offsetY,
+    lineStartX: hasExplicitUnderlineEndpoints(annotation) ? clamp01(annotation.lineStartX + offsetX) : annotation.lineStartX,
+    lineStartY: hasExplicitUnderlineEndpoints(annotation) ? clamp01(annotation.lineStartY + offsetY) : annotation.lineStartY,
+    lineEndX: hasExplicitUnderlineEndpoints(annotation) ? clamp01(annotation.lineEndX + offsetX) : annotation.lineEndX,
+    lineEndY: hasExplicitUnderlineEndpoints(annotation) ? clamp01(annotation.lineEndY + offsetY) : annotation.lineEndY,
   };
   state.pages = state.pages.map((page) =>
     page.id === currentPage.id ? { ...page, annotations: [...page.annotations, duplicate] } : page
@@ -1563,6 +1624,45 @@ async function createGlyphFromCurrentAnnotation() {
   }
 }
 
+function normalizeDictionaryQuery(value) {
+  return String(value || "")
+    .trim()
+    .replace(/\s+/g, "");
+}
+
+function buildAncientDictionaryLookupUrl(query) {
+  if (!query) {
+    return "";
+  }
+  if (query.length === 1) {
+    return `https://www.zdic.net/hans/${encodeURIComponent(query)}`;
+  }
+  return `https://www.baidu.com/s?wd=${encodeURIComponent(`${query} \u53e4\u6c49\u8bed\u8bcd\u5178`)}`;
+}
+
+function lookupAncientDictionaryForCurrentAnnotation() {
+  const annotation = getCurrentAnnotation();
+  if (!annotation) {
+    return;
+  }
+  if (annotation.type !== "char") {
+    updateStatus("\u53ea\u6709\u201c\u5b57\u201d\u7c7b\u578b\u6807\u6ce8\u652f\u6301\u67e5\u8be2\u53e4\u6c49\u8bed\u8bcd\u5178\u3002", true);
+    return;
+  }
+  const query = normalizeDictionaryQuery(annotation.originalText);
+  if (!query) {
+    updateStatus("\u8bf7\u5148\u5728\u201c\u539f\u6587\u5f55\u5165\u201d\u4e2d\u586b\u5199\u8981\u67e5\u8be2\u7684\u5b57\u8bcd\u3002", true);
+    return;
+  }
+  const lookupUrl = buildAncientDictionaryLookupUrl(query);
+  const popup = window.open(lookupUrl, "_blank", "noopener,noreferrer");
+  if (!popup) {
+    updateStatus("\u672a\u80fd\u6253\u5f00\u8bcd\u5178\u9875\u9762\uff0c\u8bf7\u68c0\u67e5\u6d4f\u89c8\u5668\u662f\u5426\u62e6\u622a\u4e86\u65b0\u6807\u7b7e\u9875\u3002", true);
+    return;
+  }
+  updateStatus(`\u5df2\u6253\u5f00\u201c${query}\u201d\u7684\u53e4\u6c49\u8bed\u8bcd\u5178\u67e5\u8be2\u3002`);
+}
+
 function removeCurrentPage() {
   const currentPage = getCurrentPage();
   if (!currentPage || state.pages.length === 1) {
@@ -1584,10 +1684,17 @@ function updatePageDimensions(width, height) {
   if (!currentPage || (!width && !height)) {
     return;
   }
-  if (currentPage.width === width && currentPage.height === height) {
+  const nextPage = { ...currentPage, width, height };
+  const repairedAnnotations = currentPage.annotations.map((annotation) => repairUnderlineAnnotation(annotation, nextPage));
+  const annotationsChanged = repairedAnnotations.some((annotation, index) =>
+    ["x", "y", "width", "height", "lineAngle", "lineStartX", "lineStartY", "lineEndX", "lineEndY"].some(
+      (key) => annotation[key] !== currentPage.annotations[index][key]
+    )
+  );
+  if (currentPage.width === width && currentPage.height === height && !annotationsChanged) {
     return;
   }
-  updateCurrentPage({ width, height });
+  updateCurrentPage({ width, height, annotations: repairedAnnotations });
 }
 
 function setupDrawing() {
@@ -1605,48 +1712,68 @@ function setupDrawing() {
   let interactionRect = null;
   let dragPointerOffset = null;
 
+  const resetInteraction = (pointerId = null) => {
+    isDrawing = false;
+    startPoint = null;
+    dragMode = null;
+    activeAnnotationId = null;
+    initialBounds = null;
+    interactionMoved = false;
+    interactionRect = null;
+    dragPointerOffset = null;
+    draftSelection = null;
+    if (layer.isConnected) {
+      renderDraftBox(layer);
+    }
+    if (layer.isConnected && pointerId !== null && pointerId !== undefined) {
+      layer.releasePointerCapture?.(pointerId);
+    }
+  };
+
   layer.onpointerdown = (event) => {
     if (event.button !== 0) {
       return;
     }
     interactionRect = createInteractionFrame(layer);
-    const rotateHandle = event.target.closest(".rotate-handle");
+    startPoint = getLayerPoint(event, interactionRect);
     const resizeHandle = event.target.closest(".resize-handle");
-    const hit = event.target.closest(".annotation-box");
-    if (rotateHandle && hit) {
-      activeAnnotationId = hit.dataset.annotationId;
-      dragMode = "rotate";
-      interactionMoved = false;
-      startPoint = getLayerPoint(event, interactionRect);
-      initialBounds = getAnnotationById(activeAnnotationId);
-      selectAnnotation(activeAnnotationId, { rerenderMainPanel: false, renderInspector: false });
-      layer.setPointerCapture?.(event.pointerId);
-      return;
-    }
-    if (resizeHandle && hit) {
-      activeAnnotationId = hit.dataset.annotationId;
+    const boxHit = event.target.closest(".annotation-box");
+    const underlineElement = event.target.closest(".annotation-underline");
+    const hit = boxHit || underlineElement;
+    const underlineHit = event.target.closest("[data-underline-hit]");
+    if (resizeHandle && boxHit) {
+      activeAnnotationId = boxHit.dataset.annotationId;
       dragMode = "resize";
       interactionMoved = false;
-      startPoint = getLayerPoint(event, interactionRect);
       initialBounds = getAnnotationById(activeAnnotationId);
       selectAnnotation(activeAnnotationId, { rerenderMainPanel: false, renderInspector: false });
       layer.setPointerCapture?.(event.pointerId);
       return;
     }
     if (hit) {
+      if (hit.dataset.style === "underline" && !underlineHit) {
+        return;
+      }
+      if (
+        hit.dataset.style === "underline" &&
+        getPointToUnderlineDistance(getAnnotationById(hit.dataset.annotationId), startPoint, interactionRect) > UNDERLINE_DRAG_TOLERANCE_PX
+      ) {
+        return;
+      }
       activeAnnotationId = hit.dataset.annotationId;
-      dragMode = "move";
+      dragMode = hit.dataset.style === "underline" ? "move-underline" : "move";
       interactionMoved = false;
-      startPoint = getLayerPoint(event, interactionRect);
       initialBounds = getAnnotationById(activeAnnotationId);
-      dragPointerOffset = getPointerOffsetWithinElement(hit, event);
+      dragPointerOffset = dragMode === "move" ? getPointerOffsetWithinElement(hit, event) : null;
       selectAnnotation(activeAnnotationId, { rerenderMainPanel: false, renderInspector: false });
       layer.setPointerCapture?.(event.pointerId);
       return;
     }
-    startPoint = getLayerPoint(event, interactionRect);
     isDrawing = true;
-    draftSelection = { left: startPoint.x, top: startPoint.y, width: 0, height: 0 };
+    draftSelection =
+      state.ui.drawStyle === "underline"
+        ? createUnderlineDraftSelection(startPoint, startPoint, interactionRect)
+        : { style: state.ui.drawStyle, left: startPoint.x, top: startPoint.y, width: 0, height: 0 };
     renderDraftBox(layer);
     layer.setPointerCapture?.(event.pointerId);
   };
@@ -1654,14 +1781,11 @@ function setupDrawing() {
   layer.onpointermove = (event) => {
     if (dragMode && activeAnnotationId && initialBounds && startPoint) {
       interactionMoved = true;
-      const current = getLayerPoint(event, interactionRect);
-      if (dragMode === "rotate") {
-        const nextAngle = getRotationAngle(initialBounds, current, interactionRect);
-        applyAngleToAnnotationElement(activeAnnotationId, nextAngle);
-        return;
-      }
+      const current = getLayerPoint(event, interactionRect || createInteractionFrame(layer));
       const nextBounds =
-        dragMode === "move"
+        dragMode === "move-underline"
+          ? getMovedUnderlineBounds(initialBounds, startPoint, current, interactionRect)
+          : dragMode === "move"
           ? getMovedBounds(initialBounds, current, interactionRect, dragPointerOffset)
           : getResizedBoundsFromTopRight(initialBounds, current, interactionRect);
       applyBoundsToAnnotationElement(activeAnnotationId, nextBounds);
@@ -1671,47 +1795,50 @@ function setupDrawing() {
       return;
     }
     const current = getLayerPoint(event, interactionRect);
-    draftSelection = {
-      left: Math.min(startPoint.x, current.x),
-      top: Math.min(startPoint.y, current.y),
-      width: Math.abs(current.x - startPoint.x),
-      height: Math.abs(current.y - startPoint.y),
-    };
+    draftSelection =
+      state.ui.drawStyle === "underline"
+        ? createUnderlineDraftSelection(startPoint, current, interactionRect)
+        : {
+            style: state.ui.drawStyle,
+            left: Math.min(startPoint.x, current.x),
+            top: Math.min(startPoint.y, current.y),
+            width: Math.abs(current.x - startPoint.x),
+            height: Math.abs(current.y - startPoint.y),
+          };
     renderDraftBox(layer);
   };
 
   const finishDrawing = (event) => {
     const rect = interactionRect || createInteractionFrame(layer);
     if (dragMode && activeAnnotationId && initialBounds && startPoint) {
-      const current = getLayerPoint(event, rect);
-      if (dragMode === "rotate") {
-        const nextAngle = getRotationAngle(initialBounds, current, rect);
-        commitAnnotationPatch(activeAnnotationId, { lineAngle: nextAngle }, interactionMoved);
-      } else {
-        const nextBounds =
-          dragMode === "move"
-            ? getMovedBounds(initialBounds, current, rect, dragPointerOffset)
-            : getResizedBoundsFromTopRight(initialBounds, current, rect);
-        commitAnnotationPatch(activeAnnotationId, nextBounds, interactionMoved);
+      if (!interactionMoved) {
+        resetInteraction(event.pointerId);
+        return;
       }
-      dragMode = null;
-      activeAnnotationId = null;
-      initialBounds = null;
-      startPoint = null;
-      interactionMoved = false;
-      interactionRect = null;
-      dragPointerOffset = null;
-      layer.releasePointerCapture?.(event.pointerId);
+      const current = getLayerPoint(event, rect);
+      const nextBounds =
+        dragMode === "move-underline"
+          ? getMovedUnderlineBounds(initialBounds, startPoint, current, rect)
+          : dragMode === "move"
+          ? getMovedBounds(initialBounds, current, rect, dragPointerOffset)
+          : getResizedBoundsFromTopRight(initialBounds, current, rect);
+      commitAnnotationPatch(activeAnnotationId, nextBounds, interactionMoved);
+      resetInteraction(event.pointerId);
       return;
     }
     if (!isDrawing || !startPoint) {
-      interactionRect = null;
+      resetInteraction(event.pointerId);
       return;
     }
     const current = getLayerPoint(event, rect);
     const width = Math.abs(current.x - startPoint.x);
     const height = Math.abs(current.y - startPoint.y);
-    if (width > 8 && height > 8) {
+    const lineLength = Math.hypot(current.x - startPoint.x, current.y - startPoint.y);
+    if (state.ui.drawStyle === "underline") {
+      if (lineLength >= UNDERLINE_MIN_LENGTH_PX) {
+        addAnnotation(getUnderlineBoundsFromPoints(startPoint, current, rect));
+      }
+    } else if (width >= ANNOTATION_MIN_SIZE_PX && height >= ANNOTATION_MIN_SIZE_PX) {
       const left = Math.min(startPoint.x, current.x);
       const top = Math.min(startPoint.y, current.y);
       addAnnotation({
@@ -1721,21 +1848,12 @@ function setupDrawing() {
         height: height / rect.height,
       });
     }
-    isDrawing = false;
-    startPoint = null;
-    draftSelection = null;
-    interactionRect = null;
-    renderDraftBox(layer);
-    layer.releasePointerCapture?.(event.pointerId);
+    resetInteraction(event.pointerId);
   };
 
   layer.onpointerup = finishDrawing;
   layer.onpointercancel = finishDrawing;
-  layer.onpointerleave = (event) => {
-    if (isDrawing) {
-      finishDrawing(event);
-    }
-  };
+  layer.onpointerleave = null;
 }
 
 function addAnnotation(bounds) {
@@ -1766,6 +1884,9 @@ function addAnnotation(bounds) {
   state.ui.currentAnnotationId = annotation.id;
   persistState();
   renderAll();
+  if (annotation.type !== "image") {
+    runOcrForCurrentAnnotation({ silent: true });
+  }
   updateStatus("已新增一条标注，请在右侧填写属性。");
 }
 
@@ -1782,19 +1903,57 @@ function renderDraftBox(layer) {
     draft.className = "draft-box";
     layer.appendChild(draft);
   }
+  if (draftSelection.style === "underline") {
+    if (!draft.querySelector("svg")) {
+      draft.innerHTML = `
+        <svg class="draft-underline-shape" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
+          <line class="draft-underline-line" vector-effect="non-scaling-stroke"></line>
+        </svg>
+      `;
+    }
+    draft.style.left = "0";
+    draft.style.top = "0";
+    draft.style.width = "100%";
+    draft.style.height = "100%";
+    draft.style.border = "none";
+    draft.style.background = "transparent";
+    draft.style.transform = "none";
+    draft.style.transformOrigin = "center center";
+    draft.style.borderRadius = "0";
+    draft.style.marginTop = "0";
+    draft.style.opacity = "0.7";
+    const line = draft.querySelector(".draft-underline-line");
+    line?.setAttribute("x1", `${draftSelection.start.x * 100}`);
+    line?.setAttribute("y1", `${draftSelection.start.y * 100}`);
+    line?.setAttribute("x2", `${draftSelection.end.x * 100}`);
+    line?.setAttribute("y2", `${draftSelection.end.y * 100}`);
+    return;
+  }
+  draft.innerHTML = "";
   draft.style.left = `${draftSelection.left}px`;
   draft.style.top = `${draftSelection.top}px`;
   draft.style.width = `${draftSelection.width}px`;
   draft.style.height = `${draftSelection.height}px`;
+  draft.style.border = "2px dashed var(--accent)";
+  draft.style.background = "rgba(159, 59, 47, 0.12)";
+  draft.style.transform = "none";
+  draft.style.transformOrigin = "center center";
+  draft.style.borderRadius = "8px";
+  draft.style.marginTop = "0";
+  draft.style.opacity = "1";
 }
 
-function renderAnnotationBox(annotation) {
+function renderAnnotationBox(annotation, page = null) {
+  return annotation.markStyle === "underline"
+    ? renderUnderlineAnnotation(annotation, page)
+    : renderBoxAnnotation(annotation);
+}
+
+function renderBoxAnnotation(annotation) {
   const fillColor = `${annotation.color}44`;
-  const rotation = annotation.markStyle === "underline" ? normalizeAngle(annotation.lineAngle) : 0;
-  const lineLengthPercent = annotation.markStyle === "underline" ? getUnderlineLineLengthPercent(annotation) : 100;
   return `
     <div
-      class="annotation-box ${annotation.id === state.ui.currentAnnotationId ? "active" : ""}"
+      class="annotation-item annotation-box ${annotation.id === state.ui.currentAnnotationId ? "active" : ""}"
       data-annotation-id="${annotation.id}"
       data-style="${annotation.markStyle}"
       style="
@@ -1804,15 +1963,54 @@ function renderAnnotationBox(annotation) {
         height:${annotation.height * 100}%;
         --annotation-color:${annotation.color};
         --annotation-fill:${fillColor};
-        --annotation-rotation:${rotation}deg;
-        --annotation-line-length:${lineLengthPercent}%;
       "
       title="${escapeAttribute(annotation.originalText || ANNOTATION_TYPES[annotation.type])}"
     >
       <span class="annotation-shape"></span>
       <span class="tag">${ANNOTATION_TYPES[annotation.type]}</span>
-      ${annotation.markStyle === "underline" ? `<span class="rotate-handle" title="拖动旋转"></span>` : ""}
       <span class="resize-handle" title="拖动缩放"></span>
+    </div>
+  `;
+}
+
+function renderUnderlineAnnotation(annotation, page = null) {
+  const frame = page ? createStoredPageFrame(page) : null;
+  const endpoints = getUnderlineNormalizedEndpoints(annotation, frame);
+  const tagAnchor = getUnderlineTagAnchor(annotation, frame);
+  return `
+    <div
+      class="annotation-item annotation-underline ${annotation.id === state.ui.currentAnnotationId ? "active" : ""}"
+      data-annotation-id="${annotation.id}"
+      data-style="${annotation.markStyle}"
+      style="
+        left:0;
+        top:0;
+        width:100%;
+        height:100%;
+        --annotation-color:${annotation.color};
+      "
+      title="${escapeAttribute(annotation.originalText || ANNOTATION_TYPES[annotation.type])}"
+    >
+      <svg class="annotation-shape" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
+        <line
+          class="annotation-line-hit"
+          data-underline-hit="true"
+          vector-effect="non-scaling-stroke"
+          x1="${endpoints.start.x * 100}"
+          y1="${endpoints.start.y * 100}"
+          x2="${endpoints.end.x * 100}"
+          y2="${endpoints.end.y * 100}"
+        ></line>
+        <line
+          class="annotation-line-visible"
+          vector-effect="non-scaling-stroke"
+          x1="${endpoints.start.x * 100}"
+          y1="${endpoints.start.y * 100}"
+          x2="${endpoints.end.x * 100}"
+          y2="${endpoints.end.y * 100}"
+        ></line>
+      </svg>
+      <span class="tag" style="left:${tagAnchor.x * 100}%;top:${tagAnchor.y * 100}%;">${ANNOTATION_TYPES[annotation.type]}</span>
     </div>
   `;
 }
@@ -1894,6 +2092,157 @@ function getMovedBounds(annotation, currentPoint, frame, pointerOffset = { x: 0,
   };
 }
 
+function getMovedUnderlineBounds(annotation, dragStartPoint, currentPoint, frame) {
+  const rect = resolveFrameMetrics(frame);
+  const endpoints = getUnderlineNormalizedEndpoints(annotation, frame);
+  const deltaX = (currentPoint.x - dragStartPoint.x) / rect.width;
+  const deltaY = (currentPoint.y - dragStartPoint.y) / rect.height;
+  const clampedDeltaX = clamp(
+    deltaX,
+    -Math.min(endpoints.start.x, endpoints.end.x),
+    1 - Math.max(endpoints.start.x, endpoints.end.x)
+  );
+  const clampedDeltaY = clamp(
+    deltaY,
+    -Math.min(endpoints.start.y, endpoints.end.y),
+    1 - Math.max(endpoints.start.y, endpoints.end.y)
+  );
+  return getUnderlineBoundsFromNormalizedPoints(
+    {
+      x: endpoints.start.x + clampedDeltaX,
+      y: endpoints.start.y + clampedDeltaY,
+    },
+    {
+      x: endpoints.end.x + clampedDeltaX,
+      y: endpoints.end.y + clampedDeltaY,
+    },
+    frame
+  );
+}
+
+function getClosestPointOnSegment(startPoint, endPoint, point) {
+  const dx = endPoint.x - startPoint.x;
+  const dy = endPoint.y - startPoint.y;
+  const lengthSquared = dx * dx + dy * dy;
+  if (lengthSquared <= UNDERLINE_COMPONENT_EPSILON) {
+    return { x: startPoint.x, y: startPoint.y };
+  }
+  const projection =
+    ((point.x - startPoint.x) * dx + (point.y - startPoint.y) * dy) / Math.max(lengthSquared, UNDERLINE_COMPONENT_EPSILON);
+  const ratio = clamp(projection, 0, 1);
+  return {
+    x: startPoint.x + dx * ratio,
+    y: startPoint.y + dy * ratio,
+  };
+}
+
+function getPointToUnderlineDistance(annotation, point, frame) {
+  const endpoints = getUnderlineEndpoints(annotation, frame);
+  const closestPoint = getClosestPointOnSegment(endpoints.start, endpoints.end, point);
+  return Math.hypot(point.x - closestPoint.x, point.y - closestPoint.y);
+}
+
+function getUnderlineBoundsFromNormalizedPoints(startPoint, endPoint, frame) {
+  const rect = resolveFrameMetrics(frame);
+  return getUnderlineBoundsFromPoints(
+    {
+      x: startPoint.x * rect.width,
+      y: startPoint.y * rect.height,
+    },
+    {
+      x: endPoint.x * rect.width,
+      y: endPoint.y * rect.height,
+    },
+    frame
+  );
+}
+
+function getLegacyUnderlineLocalPositions(annotation, frame = null) {
+  const width = Math.max(annotation.width, 0.0001);
+  const height = Math.max(annotation.height, 0.0001);
+  if (frame) {
+    const metrics = resolveFrameMetrics(frame);
+    const endpoints = getUnderlineEndpoints(annotation, frame);
+    const leftPx = annotation.x * metrics.width;
+    const topPx = annotation.y * metrics.height;
+    const widthPx = Math.max(annotation.width * metrics.width, 0.0001);
+    const heightPx = Math.max(annotation.height * metrics.height, 0.0001);
+    return {
+      start: {
+        x: clamp(((endpoints.start.x - leftPx) / widthPx) * 100, 0, 100),
+        y: clamp(((endpoints.start.y - topPx) / heightPx) * 100, 0, 100),
+      },
+      end: {
+        x: clamp(((endpoints.end.x - leftPx) / widthPx) * 100, 0, 100),
+        y: clamp(((endpoints.end.y - topPx) / heightPx) * 100, 0, 100),
+      },
+    };
+  }
+  const angle = (normalizeAngle(annotation.lineAngle) * Math.PI) / 180;
+  const lengthCandidates = [];
+  const cos = Math.abs(Math.cos(angle));
+  const sin = Math.abs(Math.sin(angle));
+  if (cos > UNDERLINE_COMPONENT_EPSILON) {
+    lengthCandidates.push(width / cos);
+  }
+  if (sin > UNDERLINE_COMPONENT_EPSILON) {
+    lengthCandidates.push(height / sin);
+  }
+  const lineLength = lengthCandidates.length ? Math.min(...lengthCandidates) : Math.max(width, height);
+  const centerX = width / 2;
+  const centerY = height / 2;
+  const dx = Math.cos(angle) * (lineLength / 2);
+  const dy = Math.sin(angle) * (lineLength / 2);
+  return {
+    start: {
+      x: clamp(((centerX - dx) / width) * 100, 0, 100),
+      y: clamp(((centerY - dy) / height) * 100, 0, 100),
+    },
+    end: {
+      x: clamp(((centerX + dx) / width) * 100, 0, 100),
+      y: clamp(((centerY + dy) / height) * 100, 0, 100),
+    },
+  };
+}
+
+function getUnderlineNormalizedEndpoints(annotation, frame = null) {
+  if (hasExplicitUnderlineEndpoints(annotation)) {
+    return {
+      start: {
+        x: annotation.lineStartX,
+        y: annotation.lineStartY,
+      },
+      end: {
+        x: annotation.lineEndX,
+        y: annotation.lineEndY,
+      },
+    };
+  }
+  const localPositions = getLegacyUnderlineLocalPositions(annotation, frame);
+  return {
+    start: {
+      x: clamp01(annotation.x + annotation.width * (localPositions.start.x / 100)),
+      y: clamp01(annotation.y + annotation.height * (localPositions.start.y / 100)),
+    },
+    end: {
+      x: clamp01(annotation.x + annotation.width * (localPositions.end.x / 100)),
+      y: clamp01(annotation.y + annotation.height * (localPositions.end.y / 100)),
+    },
+  };
+}
+
+function getUnderlineTagAnchor(annotation, frame = null) {
+  const endpoints = getUnderlineNormalizedEndpoints(annotation, frame);
+  const startIsHigher =
+    endpoints.start.y < endpoints.end.y ||
+    (Math.abs(endpoints.start.y - endpoints.end.y) <= UNDERLINE_COMPONENT_EPSILON && endpoints.start.x <= endpoints.end.x);
+  const anchorPoint = startIsHigher ? endpoints.start : endpoints.end;
+  return {
+    x: clamp01(anchorPoint.x),
+    y: clamp01(anchorPoint.y),
+  };
+}
+
 function getResizedBoundsFromTopRight(annotation, currentPoint, frame) {
   const rect = resolveFrameMetrics(frame);
   const minSize = 12;
@@ -1909,41 +2258,206 @@ function getResizedBoundsFromTopRight(annotation, currentPoint, frame) {
   };
 }
 
+function getUnderlineEndpoints(annotation, frame) {
+  const rect = resolveFrameMetrics(frame);
+  if (hasExplicitUnderlineEndpoints(annotation)) {
+    return {
+      start: { x: annotation.lineStartX * rect.width, y: annotation.lineStartY * rect.height },
+      end: { x: annotation.lineEndX * rect.width, y: annotation.lineEndY * rect.height },
+    };
+  }
+  const angle = (normalizeAngle(annotation.lineAngle) * Math.PI) / 180;
+  const centerX = (annotation.x + annotation.width / 2) * rect.width;
+  const centerY = (annotation.y + annotation.height / 2) * rect.height;
+  const lineLength = getUnderlineLineLength(annotation, frame);
+  const dx = Math.cos(angle) * (lineLength / 2);
+  const dy = Math.sin(angle) * (lineLength / 2);
+  return {
+    start: { x: centerX - dx, y: centerY - dy },
+    end: { x: centerX + dx, y: centerY + dy },
+  };
+}
+
+function getUnderlineLineLength(annotation, frame) {
+  const rect = resolveFrameMetrics(frame);
+  const angle = (normalizeAngle(annotation.lineAngle) * Math.PI) / 180;
+  const widthPx = Math.max(annotation.width * rect.width, UNDERLINE_MIN_THICKNESS_PX);
+  const heightPx = Math.max(annotation.height * rect.height, UNDERLINE_MIN_THICKNESS_PX);
+  const cos = Math.abs(Math.cos(angle));
+  const sin = Math.abs(Math.sin(angle));
+  const widthMatchesMinThickness = Math.abs(widthPx - UNDERLINE_MIN_THICKNESS_PX) < 0.01;
+  const heightMatchesMinThickness = Math.abs(heightPx - UNDERLINE_MIN_THICKNESS_PX) < 0.01;
+  if (heightMatchesMinThickness && !widthMatchesMinThickness && cos > UNDERLINE_COMPONENT_EPSILON) {
+    return widthPx / cos;
+  }
+  if (widthMatchesMinThickness && !heightMatchesMinThickness && sin > UNDERLINE_COMPONENT_EPSILON) {
+    return heightPx / sin;
+  }
+  const lengthCandidates = [];
+  if (cos > UNDERLINE_COMPONENT_EPSILON) {
+    lengthCandidates.push(widthPx / cos);
+  }
+  if (sin > UNDERLINE_COMPONENT_EPSILON) {
+    lengthCandidates.push(heightPx / sin);
+  }
+  return lengthCandidates.length ? Math.min(...lengthCandidates) : Math.max(widthPx, heightPx);
+}
+
 function applyBoundsToAnnotationElement(annotationId, bounds) {
-  const element = document.querySelector(`.annotation-box[data-annotation-id="${annotationId}"]`);
+  const element = document.querySelector(`.annotation-item[data-annotation-id="${annotationId}"]`);
   if (!element) {
+    return;
+  }
+  if (element.classList.contains("annotation-underline")) {
+    applyUnderlineGeometryToElement(element, bounds);
     return;
   }
   element.style.left = `${bounds.x * 100}%`;
   element.style.top = `${bounds.y * 100}%`;
   element.style.width = `${bounds.width * 100}%`;
   element.style.height = `${bounds.height * 100}%`;
-  if (element.dataset.style === "underline") {
-    element.style.setProperty("--annotation-line-length", `${getUnderlineLineLengthPercent(bounds)}%`);
-  }
+}
+
+function applyUnderlineGeometryToElement(element, annotation) {
+  const frame = createStoredPageFrame(getCurrentPage());
+  const endpoints = getUnderlineNormalizedEndpoints(annotation, frame);
+  const tagAnchor = getUnderlineTagAnchor(annotation, frame);
+  element.style.left = "0";
+  element.style.top = "0";
+  element.style.width = "100%";
+  element.style.height = "100%";
+  element.querySelectorAll(".annotation-shape line").forEach((line) => {
+    line.setAttribute("x1", `${endpoints.start.x * 100}`);
+    line.setAttribute("y1", `${endpoints.start.y * 100}`);
+    line.setAttribute("x2", `${endpoints.end.x * 100}`);
+    line.setAttribute("y2", `${endpoints.end.y * 100}`);
+  });
+  element.querySelector(".tag")?.setAttribute("style", `left:${tagAnchor.x * 100}%;top:${tagAnchor.y * 100}%;`);
 }
 
 function syncActiveAnnotationElement() {
-  document.querySelectorAll(".annotation-box").forEach((element) => {
+  document.querySelectorAll(".annotation-item").forEach((element) => {
     element.classList.toggle("active", element.dataset.annotationId === state.ui.currentAnnotationId);
   });
 }
 
-function applyAngleToAnnotationElement(annotationId, angle) {
-  const element = document.querySelector(`.annotation-box[data-annotation-id="${annotationId}"]`);
-  if (!element) {
-    return;
-  }
-  element.style.setProperty("--annotation-rotation", `${normalizeAngle(angle)}deg`);
+function getLineAngle(startPoint, endPoint) {
+  return normalizeAngle((Math.atan2(endPoint.y - startPoint.y, endPoint.x - startPoint.x) * 180) / Math.PI);
 }
 
-function getRotationAngle(annotation, currentPoint, frame) {
+function normalizePointToFrame(point, frame) {
   const rect = resolveFrameMetrics(frame);
-  const centerX = (annotation.x + annotation.width / 2) * rect.width;
-  const centerY = (annotation.y + annotation.height / 2) * rect.height;
-  const dx = currentPoint.x - centerX;
-  const dy = currentPoint.y - centerY;
-  return normalizeAngle((Math.atan2(dy, dx) * 180) / Math.PI);
+  return {
+    x: clamp((point.x || 0) / Math.max(1, rect.width), 0, 1),
+    y: clamp((point.y || 0) / Math.max(1, rect.height), 0, 1),
+  };
+}
+
+function createUnderlineDraftSelection(startPoint, endPoint, frame) {
+  return {
+    style: "underline",
+    start: normalizePointToFrame(startPoint, frame),
+    end: normalizePointToFrame(endPoint, frame),
+  };
+}
+
+function getUnderlineBoundsFromPoints(startPoint, endPoint, frame) {
+  const rect = resolveFrameMetrics(frame);
+  const clampedStart = {
+    x: clamp(startPoint.x, 0, rect.width),
+    y: clamp(startPoint.y, 0, rect.height),
+  };
+  const clampedEnd = {
+    x: clamp(endPoint.x, 0, rect.width),
+    y: clamp(endPoint.y, 0, rect.height),
+  };
+  const rawWidth = Math.abs(clampedEnd.x - clampedStart.x);
+  const rawHeight = Math.abs(clampedEnd.y - clampedStart.y);
+  const widthPx = Math.max(rawWidth, UNDERLINE_MIN_THICKNESS_PX);
+  const heightPx = Math.max(rawHeight, UNDERLINE_MIN_THICKNESS_PX);
+  const leftPx = clamp(
+    Math.min(clampedStart.x, clampedEnd.x) - (widthPx - rawWidth) / 2,
+    0,
+    Math.max(0, rect.width - widthPx)
+  );
+  const topPx = clamp(
+    Math.min(clampedStart.y, clampedEnd.y) - (heightPx - rawHeight) / 2,
+    0,
+    Math.max(0, rect.height - heightPx)
+  );
+  return {
+    x: leftPx / rect.width,
+    y: topPx / rect.height,
+    width: widthPx / rect.width,
+    height: heightPx / rect.height,
+    lineAngle: getLineAngle(clampedStart, clampedEnd),
+    lineStartX: clampedStart.x / rect.width,
+    lineStartY: clampedStart.y / rect.height,
+    lineEndX: clampedEnd.x / rect.width,
+    lineEndY: clampedEnd.y / rect.height,
+  };
+}
+
+function hasExplicitUnderlineEndpoints(annotation) {
+  return ["lineStartX", "lineStartY", "lineEndX", "lineEndY"].every((key) => Number.isFinite(annotation?.[key]));
+}
+
+function createStoredPageFrame(page) {
+  const width = Math.max(1, Number(page?.width) || 1);
+  const height = Math.max(1, Number(page?.height) || 1);
+  return {
+    rect: { left: 0, top: 0, width, height },
+    width,
+    height,
+  };
+}
+
+function getUpdatedUnderlineGeometryPatch(annotation, patch, page) {
+  const frame = createStoredPageFrame(page);
+  const geometryPatch = { ...patch };
+  if (!["x", "y", "width", "height", "lineAngle"].some((key) => key in patch)) {
+    return geometryPatch;
+  }
+  const localPositions = getLegacyUnderlineLocalPositions(annotation, frame);
+  const nextBounds = {
+    x: "x" in patch ? patch.x : annotation.x,
+    y: "y" in patch ? patch.y : annotation.y,
+    width: "width" in patch ? patch.width : annotation.width,
+    height: "height" in patch ? patch.height : annotation.height,
+  };
+  if (["x", "y", "width", "height"].some((key) => key in patch)) {
+    geometryPatch.lineStartX = clamp01(nextBounds.x + nextBounds.width * (localPositions.start.x / 100));
+    geometryPatch.lineStartY = clamp01(nextBounds.y + nextBounds.height * (localPositions.start.y / 100));
+    geometryPatch.lineEndX = clamp01(nextBounds.x + nextBounds.width * (localPositions.end.x / 100));
+    geometryPatch.lineEndY = clamp01(nextBounds.y + nextBounds.height * (localPositions.end.y / 100));
+  }
+  if ("lineAngle" in patch) {
+    const baseAnnotation = { ...annotation, ...geometryPatch, ...nextBounds };
+    const endpoints = getUnderlineEndpoints(baseAnnotation, frame);
+    const lineLength = Math.hypot(endpoints.end.x - endpoints.start.x, endpoints.end.y - endpoints.start.y);
+    const angle = (normalizeAngle(patch.lineAngle) * Math.PI) / 180;
+    const centerX = (baseAnnotation.x + baseAnnotation.width / 2) * frame.width;
+    const centerY = (baseAnnotation.y + baseAnnotation.height / 2) * frame.height;
+    const dx = Math.cos(angle) * (lineLength / 2);
+    const dy = Math.sin(angle) * (lineLength / 2);
+    geometryPatch.lineStartX = clamp01((centerX - dx) / frame.width);
+    geometryPatch.lineStartY = clamp01((centerY - dy) / frame.height);
+    geometryPatch.lineEndX = clamp01((centerX + dx) / frame.width);
+    geometryPatch.lineEndY = clamp01((centerY + dy) / frame.height);
+  }
+  return geometryPatch;
+}
+
+function repairUnderlineAnnotation(annotation, page) {
+  if (annotation.markStyle !== "underline" || hasExplicitUnderlineEndpoints(annotation) || !page?.width || !page?.height) {
+    return annotation;
+  }
+  const frame = createStoredPageFrame(page);
+  const endpoints = getUnderlineEndpoints(annotation, frame);
+  return {
+    ...annotation,
+    ...getUnderlineBoundsFromPoints(endpoints.start, endpoints.end, frame),
+  };
 }
 
 function commitAnnotationPatch(annotationId, patch, moved) {
@@ -1980,6 +2494,185 @@ function getCurrentPage() {
   return state.pages.find((page) => page.id === state.ui.currentPageId) || state.pages[0] || null;
 }
 
+async function runOcrForCurrentPage() {
+  const currentPage = getCurrentPage();
+  if (!currentPage) {
+    updateStatus("No page is available for OCR.", true);
+    return;
+  }
+  if (ocrRequestInFlight) {
+    updateStatus("OCR is already running. Please wait.", true);
+    return;
+  }
+
+  ocrRequestInFlight = true;
+  try {
+    updateStatus("Running Baidu OCR for the current page...");
+    const pageImage = await getPageImageForGlyph(currentPage);
+    const pageWidth = pageImage.naturalWidth || pageImage.width || currentPage.width;
+    const pageHeight = pageImage.naturalHeight || pageImage.height || currentPage.height;
+    if (!pageWidth || !pageHeight) {
+      throw new Error("page image size unavailable");
+    }
+
+    const imageDataUrl = imageToDataUrl(pageImage);
+    const result = await requestOcrForImage(imageDataUrl, currentPage.id);
+    const ocrAnnotations = buildAnnotationsFromOcrItems(result.items, { width: pageWidth, height: pageHeight });
+    const retainedAnnotations = currentPage.annotations.filter((annotation) => annotation.source !== OCR_SOURCE_BAIDU_PAGE);
+    state.pages = state.pages.map((page) =>
+      page.id === currentPage.id
+        ? {
+            ...page,
+            width: pageWidth,
+            height: pageHeight,
+            annotations: [...retainedAnnotations, ...ocrAnnotations],
+          }
+        : page
+    );
+    state.ui.currentAnnotationId = ocrAnnotations[0]?.id || retainedAnnotations[0]?.id || null;
+    persistState();
+    renderAll();
+    updateStatus(
+      ocrAnnotations.length
+        ? `Baidu OCR completed. Imported ${ocrAnnotations.length} annotations.`
+        : "Baidu OCR completed, but no text was imported."
+    );
+  } catch (error) {
+    console.error("run ocr failed", error);
+    updateStatus(error.message || "Baidu OCR failed.", true);
+  } finally {
+    ocrRequestInFlight = false;
+  }
+}
+
+async function runOcrForCurrentAnnotation({ silent = false } = {}) {
+  const currentPage = getCurrentPage();
+  const annotation = getCurrentAnnotation();
+  if (!currentPage || !annotation) {
+    if (!silent) {
+      updateStatus("Select an annotation before running OCR.", true);
+    }
+    return;
+  }
+  if (annotation.type === "image") {
+    if (!silent) {
+      updateStatus("Image annotations do not support text OCR.", true);
+    }
+    return;
+  }
+  if (ocrRequestInFlight) {
+    if (!silent) {
+      updateStatus("OCR is already running. Please wait.", true);
+    }
+    return;
+  }
+
+  ocrRequestInFlight = true;
+  try {
+    if (!silent) {
+      updateStatus("Running Baidu OCR for the selected annotation...");
+    }
+    const pageImage = await getPageImageForGlyph(currentPage);
+    const imageDataUrl = cropAnnotationToDataUrl(pageImage, annotation, { paddingRatio: OCR_SELECTION_PADDING_RATIO });
+    const result = await requestOcrForImage(imageDataUrl, currentPage.id);
+    const recognizedText = mergeOcrItemsToText(result.items);
+    if (!recognizedText) {
+      if (!silent) {
+        updateStatus("No text was recognized inside the selected annotation.");
+      }
+      return;
+    }
+
+    const confidence = getOcrConfidenceAverage(result.items);
+    updateCurrentAnnotation(
+      {
+        originalText: recognizedText,
+        source: OCR_SOURCE_BAIDU_SELECTION,
+        ocrConfidence: confidence,
+      },
+      {
+        renderMainPanel: true,
+        renderInspector: true,
+      }
+    );
+    if (!silent) {
+      updateStatus(`Filled original text with OCR: ${recognizedText}`);
+    }
+  } catch (error) {
+    console.error("run annotation ocr failed", error);
+    if (!silent) {
+      updateStatus(error.message || "Baidu OCR failed for the selected annotation.", true);
+    }
+  } finally {
+    ocrRequestInFlight = false;
+  }
+}
+
+function clearOcrAnnotationsForCurrentPage() {
+  const currentPage = getCurrentPage();
+  if (!currentPage) {
+    return;
+  }
+  const retainedAnnotations = currentPage.annotations.filter((annotation) => annotation.source !== OCR_SOURCE_BAIDU_PAGE);
+  const removedCount = currentPage.annotations.length - retainedAnnotations.length;
+  if (!removedCount) {
+    updateStatus("There are no OCR annotations on this page.");
+    return;
+  }
+
+  state.pages = state.pages.map((page) =>
+    page.id === currentPage.id ? { ...page, annotations: retainedAnnotations } : page
+  );
+  if (state.ui.currentAnnotationId && !retainedAnnotations.some((annotation) => annotation.id === state.ui.currentAnnotationId)) {
+    state.ui.currentAnnotationId = retainedAnnotations[0]?.id || null;
+  }
+  persistState();
+  renderAll();
+  updateStatus(`Cleared ${removedCount} OCR annotations from the current page.`);
+}
+
+async function requestOcrForImage(imageDataUrl, pageId = "") {
+  const response = await fetch("/api/ocr/page", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      pageId,
+      imageDataUrl,
+    }),
+  });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(result.error || "Baidu OCR request failed.");
+  }
+  return result;
+}
+
+function mergeOcrItemsToText(items) {
+  if (!Array.isArray(items) || !items.length) {
+    return "";
+  }
+  return items
+    .map((item) => String(item?.text || "").trim())
+    .filter(Boolean)
+    .join("");
+}
+
+function getOcrConfidenceAverage(items) {
+  if (!Array.isArray(items) || !items.length) {
+    return null;
+  }
+  const numericValues = items
+    .map((item) => Number(item?.confidence))
+    .filter((value) => Number.isFinite(value));
+  if (!numericValues.length) {
+    return null;
+  }
+  const sum = numericValues.reduce((total, value) => total + value, 0);
+  return round(sum / numericValues.length);
+}
+
 function getCurrentAnnotation() {
   const currentPage = getCurrentPage();
   return currentPage?.annotations.find((annotation) => annotation.id === state.ui.currentAnnotationId) || null;
@@ -2005,7 +2698,10 @@ function updateStatus(message, isError = false) {
 
 function showRuntimeHint() {
   if (window.location.protocol === "file:") {
-    updateStatus("建议用 start-local-server.bat 启动后访问 http://127.0.0.1:8000/index.html，以保证 PDF 导入和本地资源正常工作。", true);
+    updateStatus(
+      "Start start-local-server.bat and open http://127.0.0.1:8000/index.html so PDF import, Baidu OCR, and local assets work correctly.",
+      true
+    );
   }
 }
 
@@ -2156,14 +2852,15 @@ function buildXml(appState) {
       const width = round(annotation.width * (page.width || 1000));
       const height = round(annotation.height * (page.height || 1000));
       if (annotation.markStyle === "underline") {
-        const angle = (normalizeAngle(annotation.lineAngle) * Math.PI) / 180;
-        const centerX = x + width / 2;
-        const centerY = y + height / 2;
-        const lineLength = Math.max(width, height);
-        const dx = Math.cos(angle) * (lineLength / 2);
-        const dy = Math.sin(angle) * (lineLength / 2);
+        const pageWidth = page.width || 1000;
+        const pageHeight = page.height || 1000;
+        const endpoints = getUnderlineEndpoints(annotation, {
+          rect: { left: 0, top: 0, width: pageWidth, height: pageHeight },
+          width: pageWidth,
+          height: pageHeight,
+        });
         lines.push(
-          `      <line x1="${round(centerX - dx)}" y1="${round(centerY - dy)}" x2="${round(centerX + dx)}" y2="${round(centerY + dy)}" stroke="${escapeXml(
+          `      <line x1="${round(endpoints.start.x)}" y1="${round(endpoints.start.y)}" x2="${round(endpoints.end.x)}" y2="${round(endpoints.end.y)}" stroke="${escapeXml(
             annotation.color
           )}" data-angle="${round(annotation.lineAngle)}" />`
         );
@@ -2311,6 +3008,72 @@ function readFileAsDataUrl(file) {
   });
 }
 
+function imageToDataUrl(image, mimeType = "image/png") {
+  const width = image.naturalWidth || image.width;
+  const height = image.naturalHeight || image.height;
+  if (!width || !height) {
+    throw new Error("page image size unavailable");
+  }
+
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const context = canvas.getContext("2d", { alpha: false });
+  if (!context) {
+    throw new Error("canvas 2d context unavailable");
+  }
+  context.drawImage(image, 0, 0, width, height);
+  return canvas.toDataURL(mimeType);
+}
+
+function buildAnnotationsFromOcrItems(items, pageMetrics) {
+  if (!Array.isArray(items) || !pageMetrics?.width || !pageMetrics?.height) {
+    return [];
+  }
+
+  return items
+    .map((item, index) => createAnnotationFromOcrItem(item, pageMetrics, index))
+    .filter(Boolean);
+}
+
+function createAnnotationFromOcrItem(item, pageMetrics, index) {
+  const text = String(item?.text || "").trim();
+  const left = Number(item?.left);
+  const top = Number(item?.top);
+  const width = Number(item?.width);
+  const height = Number(item?.height);
+  if (!text || !Number.isFinite(left) || !Number.isFinite(top) || !Number.isFinite(width) || !Number.isFinite(height)) {
+    return null;
+  }
+
+  const safeLeft = clamp(left, 0, Math.max(0, pageMetrics.width - 1));
+  const safeTop = clamp(top, 0, Math.max(0, pageMetrics.height - 1));
+  const safeRight = clamp(left + width, safeLeft + 1, pageMetrics.width);
+  const safeBottom = clamp(top + height, safeTop + 1, pageMetrics.height);
+  return normalizeAnnotation(
+    {
+      id: `annotation-${crypto.randomUUID()}`,
+      type: String(item?.level || "").toLowerCase() === "word" ? "sentence" : "char",
+      markStyle: "box",
+      color: "#2f6c9f",
+      originalText: text,
+      simplifiedText: "",
+      note: "",
+      noteType: "1",
+      customGlyphId: "",
+      customCode: "",
+      lineAngle: 0,
+      x: safeLeft / pageMetrics.width,
+      y: safeTop / pageMetrics.height,
+      width: (safeRight - safeLeft) / pageMetrics.width,
+      height: (safeBottom - safeTop) / pageMetrics.height,
+      source: OCR_SOURCE_BAIDU_PAGE,
+      ocrConfidence: Number.isFinite(Number(item?.confidence)) ? Number(item.confidence) : null,
+    },
+    index
+  );
+}
+
 function getPageImageForGlyph(page) {
   const currentPage = getCurrentPage();
   const liveImage =
@@ -2327,17 +3090,24 @@ function getPageImageForGlyph(page) {
   });
 }
 
-function cropAnnotationToDataUrl(image, annotation) {
+function cropAnnotationToDataUrl(image, annotation, { paddingRatio = 0 } = {}) {
   const imageWidth = image.naturalWidth || image.width;
   const imageHeight = image.naturalHeight || image.height;
   if (!imageWidth || !imageHeight) {
     throw new Error("page image size unavailable");
   }
 
-  const left = clamp(Math.floor(annotation.x * imageWidth), 0, Math.max(0, imageWidth - 1));
-  const top = clamp(Math.floor(annotation.y * imageHeight), 0, Math.max(0, imageHeight - 1));
-  const right = clamp(Math.ceil((annotation.x + annotation.width) * imageWidth), left + 1, imageWidth);
-  const bottom = clamp(Math.ceil((annotation.y + annotation.height) * imageHeight), top + 1, imageHeight);
+  const rawLeft = annotation.x * imageWidth;
+  const rawTop = annotation.y * imageHeight;
+  const rawRight = (annotation.x + annotation.width) * imageWidth;
+  const rawBottom = (annotation.y + annotation.height) * imageHeight;
+  const paddingX = Math.max(1, (rawRight - rawLeft) * Math.max(0, paddingRatio));
+  const paddingY = Math.max(1, (rawBottom - rawTop) * Math.max(0, paddingRatio));
+
+  const left = clamp(Math.floor(rawLeft - paddingX), 0, Math.max(0, imageWidth - 1));
+  const top = clamp(Math.floor(rawTop - paddingY), 0, Math.max(0, imageHeight - 1));
+  const right = clamp(Math.ceil(rawRight + paddingX), left + 1, imageWidth);
+  const bottom = clamp(Math.ceil(rawBottom + paddingY), top + 1, imageHeight);
   const cropWidth = Math.max(1, right - left);
   const cropHeight = Math.max(1, bottom - top);
 
@@ -2389,12 +3159,6 @@ function normalizeAngle(value) {
   }
   const normalized = ((num % 360) + 360) % 360;
   return normalized;
-}
-
-function getUnderlineLineLengthPercent(bounds) {
-  const baseWidth = Math.max(bounds.width, 0.0001);
-  const diagonal = Math.hypot(bounds.width, bounds.height);
-  return Math.max(100, round((diagonal / baseWidth) * 100));
 }
 
 function round(value) {

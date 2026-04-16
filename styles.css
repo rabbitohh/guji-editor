@@ -408,6 +408,8 @@ h1 {
 }
 
 .canvas-stage img {
+  position: relative;
+  z-index: 0;
   display: block;
   max-width: none;
   width: 100%;
@@ -419,22 +421,36 @@ h1 {
 .annotation-layer {
   position: absolute;
   inset: 0;
+  z-index: 1;
 }
 
-.annotation-box,
+.annotation-item,
 .draft-box {
   position: absolute;
   border-radius: 8px;
 }
 
-.annotation-box {
-  cursor: pointer;
-  transition: box-shadow 0.15s ease;
+.draft-box {
+  pointer-events: none;
+}
+
+.annotation-item {
   touch-action: none;
 }
 
-.annotation-box:hover,
-.annotation-box.active {
+.annotation-box {
+  cursor: pointer;
+  transition: box-shadow 0.15s ease;
+}
+
+.annotation-underline {
+  overflow: visible;
+  pointer-events: none;
+  border-radius: 0;
+}
+
+.annotation-item:hover,
+.annotation-item.active {
   z-index: 2;
 }
 
@@ -460,20 +476,53 @@ h1 {
   background: var(--annotation-fill, rgba(166, 64, 50, 0.24));
 }
 
-.annotation-box[data-style="underline"] .annotation-shape {
-  inset: auto 0 auto 0;
-  top: 50%;
-  height: 0;
-  width: var(--annotation-line-length, 100%);
-  left: 50%;
-  border-top: 4px solid var(--annotation-color, #a64032);
-  border-radius: 999px;
-  transform: translate(-50%, -50%) rotate(var(--annotation-rotation, 0deg));
-  transform-origin: center center;
+.annotation-underline .annotation-shape {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  border-radius: 0;
   background: transparent;
+  overflow: visible;
+  pointer-events: none;
 }
 
-.annotation-box .tag {
+.annotation-underline .annotation-line-visible {
+  stroke: var(--annotation-color, #a64032);
+  stroke-width: 3px;
+  stroke-linecap: round;
+  fill: none;
+  pointer-events: none;
+}
+
+.annotation-underline .annotation-line-hit {
+  stroke: transparent;
+  stroke-width: 8px;
+  stroke-linecap: round;
+  fill: none;
+  pointer-events: stroke;
+  cursor: move;
+}
+
+.annotation-underline .tag {
+  pointer-events: none;
+  transform: translateY(calc(-100% - 4px));
+}
+
+.draft-underline-shape {
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+}
+
+.draft-underline-line {
+  stroke: var(--accent);
+  stroke-width: 3px;
+  stroke-linecap: round;
+  fill: none;
+}
+
+.annotation-item .tag {
   position: absolute;
   top: -12px;
   left: 0;
@@ -490,6 +539,7 @@ h1 {
   box-shadow: 0 4px 10px rgba(44, 36, 24, 0.18);
   font-weight: 700;
   pointer-events: none;
+  opacity: 0.6;
 }
 
 .annotation-box .resize-handle {
@@ -503,36 +553,6 @@ h1 {
   border: 2px solid var(--annotation-color, #a64032);
   box-shadow: 0 3px 8px rgba(44, 36, 24, 0.22);
   cursor: nesw-resize;
-}
-
-.annotation-box .rotate-handle {
-  position: absolute;
-  top: -30px;
-  left: 50%;
-  width: 16px;
-  height: 16px;
-  margin-left: -8px;
-  border-radius: 50%;
-  background: #fff7ea;
-  border: 2px solid var(--annotation-color, #a64032);
-  box-shadow: 0 3px 8px rgba(44, 36, 24, 0.22);
-  cursor: grab;
-}
-
-.annotation-box .rotate-handle::before {
-  content: "";
-  position: absolute;
-  left: 50%;
-  top: 14px;
-  width: 2px;
-  height: 14px;
-  margin-left: -1px;
-  background: var(--annotation-color, #a64032);
-  border-radius: 999px;
-}
-
-.annotation-box .rotate-handle:active {
-  cursor: grabbing;
 }
 
 .annotation-box .resize-handle::before,

@@ -1,0 +1,3 @@
+@echo off
+set "BAIDU_OCR_API_KEY=cbnshr8k5fsE5SOqRZNBxkRY"
+set "BAIDU_OCR_SECRET_KEY=CfTxY1VBF52fvFyeSSOiXuYdRXC0i05g"
